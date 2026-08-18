@@ -50,7 +50,12 @@ export class ChatService {
     };
     await dbService.addMessage(conversationId, userMessage, effectiveUserId);
 
-    // 2. Query Embedding & Vector Search (with fast bounded retry & degraded fallback)
+    // 2. Query Intent Classification & Multi-Facet Analysis
+    const intentAnalysis = rerankService.detectQueryIntent(query);
+    const isSummaryMode = intentAnalysis.isSummaryOrCrossSection;
+    const candidateLimit = isSummaryMode ? 40 : (config.rag.topKCandidates || 20);
+
+    // 3. Query Embedding & Vector Search (with fast bounded retry & degraded fallback)
     const embedTimer = metricsService.startTimer();
     let vectorResults: any[] = [];
     let isVectorDegraded = false;
@@ -60,11 +65,11 @@ export class ChatService {
       metrics.queryProcessingTimeMs = embedTimer.stop();
       metrics.vectorUnavailable = false;
 
-      // 3. Parallel Retrieval: Qdrant Vector Search
+      // Parallel Retrieval: Qdrant Vector Search
       const vectorTimer = metricsService.startTimer();
       vectorResults = await vectorService.search({
         vector: queryVector,
-        limit: config.rag.topKCandidates || 20,
+        limit: candidateLimit,
         filter: {
           collectionId: options.collectionId,
           documentId: options.documentId,
@@ -84,7 +89,7 @@ export class ChatService {
     const bm25Timer = metricsService.startTimer();
     const keywordResults = await keywordService.search({
       query,
-      limit: config.rag.topKCandidates || 20,
+      limit: candidateLimit,
       filter: {
         collectionId: options.collectionId,
         documentId: options.documentId,
@@ -92,6 +97,70 @@ export class ChatService {
       },
     });
     metrics.bm25LatencyMs = bm25Timer.stop();
+
+    // 3b. If in Document Summary / Cross-Section mode, run multi-facet sub-query expansion
+    if (isSummaryMode) {
+      const seenKeywordChunkIds = new Set(keywordResults.map(r => r.chunkId));
+      for (const facet of intentAnalysis.facets) {
+        try {
+          const facetKwResults = await keywordService.search({
+            query: facet.subQuery,
+            limit: 8,
+            filter: {
+              collectionId: options.collectionId,
+              documentId: options.documentId,
+              userId: effectiveUserId,
+            },
+          });
+          for (const fr of facetKwResults) {
+            if (!seenKeywordChunkIds.has(fr.chunkId)) {
+              seenKeywordChunkIds.add(fr.chunkId);
+              keywordResults.push(fr);
+            }
+          }
+        } catch {
+          // Continue with next facet
+        }
+      }
+
+      // If a specific document or single document exists, add stratified structural samples
+      const allChunks = await dbService.getAllChunks(effectiveUserId);
+      const targetDocChunks = options.documentId
+        ? allChunks.filter(c => c.documentId === options.documentId)
+        : allChunks;
+
+      if (targetDocChunks.length > 0) {
+        const sorted = [...targetDocChunks].sort((a, b) => a.chunkIndex - b.chunkIndex);
+        // Sample representative chunks from intro, middle (methods/experiments), and conclusion
+        const sampleIndices = [
+          0,
+          Math.min(1, sorted.length - 1),
+          Math.floor(sorted.length * 0.25),
+          Math.floor(sorted.length * 0.5),
+          Math.floor(sorted.length * 0.75),
+          Math.max(0, sorted.length - 2),
+          Math.max(0, sorted.length - 1),
+        ];
+
+        for (const idx of sampleIndices) {
+          const c = sorted[idx];
+          if (c && !seenKeywordChunkIds.has(c.id)) {
+            seenKeywordChunkIds.add(c.id);
+            keywordResults.push({
+              chunkId: c.id,
+              documentId: c.documentId,
+              score: 0.45,
+              content: c.content,
+              title: c.documentTitle,
+              type: 'PDF',
+              pageNumber: c.pageNumber,
+              slideNumber: c.slideNumber,
+              sectionHeader: c.sectionHeader,
+            });
+          }
+        }
+      }
+    }
 
     // Check if query is asking for visual elements, figures, charts, tables, graphs, or trends
     const visualQueryRegex = /\b(graph|graphs|chart|charts|figure|figures|fig|table|tables|diagram|diagrams|image|images|trend|trends|axis|axes|plot|plots|visual|curve|curves|histogram|histograms|page|participant|participants)\b/i;
@@ -128,27 +197,37 @@ export class ChatService {
 
     // 4. Reciprocal Rank Fusion (RRF)
     const rrfTimer = metricsService.startTimer();
+    const rrfTopN = isSummaryMode ? 12 : (config.rag.topKReranked || 6);
     const rrfCandidates = rerankService.reciprocalRankFusion(vectorResults, keywordResults, {
       k: config.rag.rrfConstantK || 60,
-      topN: config.rag.topKReranked || 6,
+      topN: rrfTopN,
     });
     metrics.rrfLatencyMs = rrfTimer.stop();
 
     // 5. Neural Cross-Encoder Reranking
     const rerankTimer = metricsService.startTimer();
+    const rerankTopK = isSummaryMode ? 10 : (config.rag.topKReranked || 6);
     const finalCandidates = await rerankService.neuralRerank(
       query,
       rrfCandidates,
-      config.rag.topKReranked || 6,
+      rerankTopK,
       {
         skipNeural: isVectorDegraded,
-        timeoutMs: 1500,
+        timeoutMs: 2500,
+        isSummaryMode,
+        facets: intentAnalysis.facets,
       }
     );
     metrics.rerankLatencyMs = rerankTimer.stop();
 
     // 6. Grounding Gate: verify candidates have factual relevant evidence
-    const validCandidates = rerankService.filterGroundedCandidates(query, finalCandidates);
+    const validCandidates = rerankService.filterGroundedCandidates(query, finalCandidates, {
+      isSummaryMode,
+      intentAnalysis,
+      onDiagnostic: (diag) => {
+        console.log(`[RAG Audit] Query: "${diag.query.slice(0, 80)}" | Intent: ${diag.queryIntent} | Grounding: ${diag.groundingStatus} (Score: ${diag.groundingScore}) | Selected: ${diag.finalSelectedChunks.length} chunks | Pages: [${diag.pageNumbers.slice(0, 10).join(', ')}] | Reason: ${diag.reason}`);
+      },
+    });
     const groundingPassed = validCandidates.length > 0;
     metrics.groundingPassed = groundingPassed;
     metrics.groundingStatus = groundingPassed ? 'GROUNDED' : 'INSUFFICIENT_EVIDENCE';

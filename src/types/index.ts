@@ -88,6 +88,22 @@ export interface Chunk {
   embedding?: number[];
 }
 
+export interface DocumentMetrics {
+  parsingTimeMs?: number;
+  chunkingTimeMs?: number;
+  visualExtractionTimeMs?: number;
+  embeddingTimeMs?: number;
+  qdrantTimeMs?: number;
+  bm25TimeMs?: number;
+  databaseTimeMs?: number;
+  totalTimeMs?: number;
+  embeddingCalls?: number;
+  embeddingBatchSize?: number;
+  qdrantBatchSize?: number;
+  charCount?: number;
+  deduplicated?: boolean;
+}
+
 export interface Document {
   id: string;
   userId?: string;
@@ -97,6 +113,7 @@ export interface Document {
   category: DocumentCategory;
   collectionId?: string;
   collectionName?: string;
+  contentHash?: string;
   status: DocumentStatus;
   progress: number; // 0 to 100
   statusMessage?: string;
@@ -112,6 +129,7 @@ export interface Document {
   createdAt: string;
   updatedAt: string;
   contentPreview?: string;
+  metrics?: DocumentMetrics;
 }
 
 export interface Citation {

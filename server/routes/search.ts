@@ -30,7 +30,12 @@ const handleSearch = async (req: Request, res: Response) => {
     let isVectorDegraded = false;
     let vectorErrorMsg = '';
 
-    // 1. Query Embedding & Vector Search with Controlled Fallback
+    // 1. Intent Analysis
+    const intentAnalysis = rerankService.detectQueryIntent(query);
+    const isSummaryMode = intentAnalysis.isSummaryOrCrossSection;
+    const candidateLimit = isSummaryMode ? Math.max(limit * 3, 30) : (config.rag.topKCandidates || 20);
+
+    // 2. Query Embedding & Vector Search with Controlled Fallback
     const embedTimer = metricsService.startTimer();
     try {
       const queryVector = await vectorService.getEmbedding(query, { isQuery: true });
@@ -39,7 +44,7 @@ const handleSearch = async (req: Request, res: Response) => {
       const vectorTimer = metricsService.startTimer();
       vectorResults = await vectorService.search({
         vector: queryVector,
-        limit: config.rag.topKCandidates || 20,
+        limit: candidateLimit,
         filter: { collectionId, documentId, userId },
       });
       metrics.vectorSearchLatencyMs = vectorTimer.stop();
@@ -57,36 +62,64 @@ const handleSearch = async (req: Request, res: Response) => {
       console.warn(`[Search] Vector search unavailable (${vectorErrorMsg}). Falling back to BM25 lexical index.`);
     }
 
-    // 2. BM25 Sparse Search
+    // 3. BM25 Sparse Search
     const bm25Timer = metricsService.startTimer();
-    const keywordResults = await keywordService.search({
+    let keywordResults = await keywordService.search({
       query,
-      limit: config.rag.topKCandidates || 20,
+      limit: candidateLimit,
       filter: { collectionId, documentId, userId },
     });
     metrics.bm25LatencyMs = bm25Timer.stop();
 
-    // 3. RRF Fusion (Cleanly fuses available candidate sets)
+    // 3b. Summary sub-query expansion
+    if (isSummaryMode) {
+      const seenIds = new Set(keywordResults.map(r => r.chunkId));
+      for (const facet of intentAnalysis.facets) {
+        try {
+          const facetHits = await keywordService.search({
+            query: facet.subQuery,
+            limit: 6,
+            filter: { collectionId, documentId, userId },
+          });
+          for (const fh of facetHits) {
+            if (!seenIds.has(fh.chunkId)) {
+              seenIds.add(fh.chunkId);
+              keywordResults.push(fh);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // 4. RRF Fusion (Cleanly fuses available candidate sets)
     const rrfTimer = metricsService.startTimer();
     const rrfCandidates = rerankService.reciprocalRankFusion(vectorResults, keywordResults, {
       k: config.rag.rrfConstantK || 60,
-      topN: limit * 2,
+      topN: Math.max(limit * 2, 16),
     });
     metrics.rrfLatencyMs = rrfTimer.stop();
 
-    // 4. Neural Cross-Encoder Reranking
+    // 5. Neural Cross-Encoder Reranking
     const rerankTimer = metricsService.startTimer();
     const finalCandidates = await rerankService.neuralRerank(query, rrfCandidates, limit, {
       skipNeural: isVectorDegraded,
-      timeoutMs: 1500,
+      timeoutMs: 2000,
+      isSummaryMode,
+      facets: intentAnalysis.facets,
     });
     metrics.rerankLatencyMs = rerankTimer.stop();
 
-    // Grounding Gate Filter
-    const validCandidates = rerankService.filterGroundedCandidates(query, finalCandidates);
+    // Grounding Gate Filter with Diagnostic Telemetry
+    const validCandidates = rerankService.filterGroundedCandidates(query, finalCandidates, {
+      isSummaryMode,
+      intentAnalysis,
+    });
     const groundingPassed = validCandidates.length > 0;
     metrics.groundingPassed = groundingPassed;
     metrics.groundingStatus = groundingPassed ? 'GROUNDED' : 'INSUFFICIENT_EVIDENCE';
+    metrics.queryIntent = intentAnalysis.intent;
 
     // 5. Context & Citations
     const grounded = ContextService.buildGroundedContext(validCandidates, 3000);
