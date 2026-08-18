@@ -1,0 +1,1 @@
+Distributed consensus algorithms like Raft and Paxos provide fault tolerance in replicated state machines with leader election.

@@ -1,0 +1,1 @@
+This is a test document ensuring the notification bell and indexing pipeline trigger real SUCCESS notifications with accurate message context.

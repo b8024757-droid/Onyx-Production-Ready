@@ -1,0 +1,6 @@
+{
+  "name": "ONYX",
+  "description": "ONYX — Private Intelligence OS. Multi-source AI knowledge system with hybrid RAG retrieval, document ingestion, and grounded conversational intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
