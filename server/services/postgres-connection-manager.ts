@@ -1,16 +1,23 @@
 /**
  * Second Brain — Production PostgreSQL Connection Manager & URL Normalizer
- * Robust normalization, SSL/TLS negotiation, diagnostic messaging,
+ * Robust normalization, intelligent IPv4/IPv6 dual-stack DNS resolution,
+ * SSL/TLS negotiation, sanitized diagnostic messaging,
  * and encrypted per-tenant BYOD database isolation.
  */
 
 import { Pool, PoolConfig } from 'pg';
 import { URL } from 'url';
+import dns from 'dns';
+import net from 'net';
+
+export type PostgresPoolConfig = PoolConfig & {
+  lookup?: (hostname: string, options: any, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void) => void;
+};
 
 export interface PostgresNormalizedResult {
   rawUrl: string;
   normalizedUrl: string;
-  poolConfig: PoolConfig;
+  poolConfig: PostgresPoolConfig;
   requiresTls: boolean;
   sslMode: 'require' | 'prefer' | 'disable' | 'no-verify' | 'default';
   isLocalhost: boolean;
@@ -39,6 +46,8 @@ export interface PostgresVerificationResult {
     port: number;
     database: string;
     provider: string;
+    ipFamily?: number;
+    resolvedAddress?: string;
   };
 }
 
@@ -49,6 +58,7 @@ const KNOWN_TLS_PROVIDERS: Array<{ domain: string; name: string }> = [
   { domain: 'singapore-postgres.render.com', name: 'Render PostgreSQL (Singapore)' },
   { domain: 'render.com', name: 'Render PostgreSQL' },
   { domain: 'neon.tech', name: 'Neon Serverless Postgres' },
+  { domain: 'pooler.supabase.com', name: 'Supabase Connection Pooler' },
   { domain: 'supabase.co', name: 'Supabase PostgreSQL' },
   { domain: 'supabase.com', name: 'Supabase PostgreSQL' },
   { domain: 'rds.amazonaws.com', name: 'AWS RDS PostgreSQL' },
@@ -60,6 +70,83 @@ const KNOWN_TLS_PROVIDERS: Array<{ domain: string; name: string }> = [
 ];
 
 export class PostgresConnectionManager {
+  /**
+   * Creates an intelligent DNS lookup function that:
+   * 1. Inspects all A (IPv4) and AAAA (IPv6) records for the hostname.
+   * 2. Prefers IPv4 addresses when both IPv4 and IPv6 are available, preventing ENETUNREACH errors in IPv4-only cloud environments (e.g. Render, AWS ECS, Cloud Run).
+   * 3. Gracefully falls back to IPv6 only when no IPv4 address exists.
+   * 4. Preserves the original hostname so TLS SNI (`servername`) and certificate validation remain intact.
+   */
+  public static createSmartLookup(
+    onResolved?: (address: string, family: number) => void
+  ) {
+    return (
+      hostname: string,
+      options: any,
+      callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void
+    ) => {
+      // 1. Literal IPv4 address
+      if (net.isIPv4(hostname)) {
+        if (onResolved) onResolved(hostname, 4);
+        return callback(null, hostname, 4);
+      }
+
+      // 2. Literal IPv6 address
+      if (net.isIPv6(hostname)) {
+        if (onResolved) onResolved(hostname, 6);
+        return callback(null, hostname, 6);
+      }
+
+      // 3. Localhost or private local domain
+      if (hostname === 'localhost' || hostname.endsWith('.local')) {
+        dns.lookup(hostname, { all: true }, (err, addresses) => {
+          if (err || !addresses || addresses.length === 0) {
+            // Fallback default lookup
+            return dns.lookup(hostname, options, callback);
+          }
+          const ipv4 = addresses.find((a) => a.family === 4);
+          if (ipv4) {
+            if (onResolved) onResolved(ipv4.address, 4);
+            return callback(null, ipv4.address, 4);
+          }
+          if (onResolved) onResolved(addresses[0].address, addresses[0].family);
+          return callback(null, addresses[0].address, addresses[0].family);
+        });
+        return;
+      }
+
+      // 4. Remote hostnames: resolve all records to intelligently prefer IPv4
+      dns.lookup(hostname, { all: true }, (err, addresses) => {
+        if (err) {
+          return callback(err, '', 4);
+        }
+
+        if (!addresses || addresses.length === 0) {
+          const notFoundErr: NodeJS.ErrnoException = new Error(`ENOTFOUND ${hostname}`);
+          notFoundErr.code = 'ENOTFOUND';
+          return callback(notFoundErr, '', 4);
+        }
+
+        // Prefer IPv4 if available
+        const ipv4 = addresses.find((a) => a.family === 4);
+        if (ipv4) {
+          if (onResolved) onResolved(ipv4.address, 4);
+          return callback(null, ipv4.address, 4);
+        }
+
+        // Fallback to IPv6 if only IPv6 is published by DNS
+        const ipv6 = addresses.find((a) => a.family === 6);
+        if (ipv6) {
+          if (onResolved) onResolved(ipv6.address, 6);
+          return callback(null, ipv6.address, 6);
+        }
+
+        if (onResolved) onResolved(addresses[0].address, addresses[0].family);
+        return callback(null, addresses[0].address, addresses[0].family);
+      });
+    };
+  }
+
   /**
    * Normalizes a user-supplied PostgreSQL connection URL without destroying existing query params.
    * Parses credentials safely and handles SSL mode parameters.
@@ -141,8 +228,8 @@ export class PostgresConnectionManager {
     const maskedHost = host.length > 4 ? `${host.slice(0, 3)}***${host.slice(-4)}` : '***';
     const maskedDatabase = database ? `${database.slice(0, 2)}***` : '***';
 
-    // Construct pg PoolConfig
-    const poolConfig: PoolConfig = {
+    // Construct pg PoolConfig with smart IPv4-preferred DNS lookup
+    const poolConfig: PostgresPoolConfig = {
       host,
       port,
       database,
@@ -151,6 +238,7 @@ export class PostgresConnectionManager {
       connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
       max: 10,
+      lookup: PostgresConnectionManager.createSmartLookup(),
     };
 
     if (shouldEnableTls && sslMode !== 'disable') {
@@ -209,14 +297,46 @@ export class PostgresConnectionManager {
 
     const { host, port, database, diagnostics } = initialParse;
 
+    // Pre-flight DNS diagnostic check to understand available IP families
+    let dnsDbg = {
+      hasIpv4: false,
+      hasIpv6: false,
+      ipv4Count: 0,
+      ipv6Count: 0,
+      ipv6Sample: '',
+      resolvedIp: '',
+      resolvedFamily: 4,
+    };
+
+    if (!initialParse.isLocalhost && !net.isIP(host)) {
+      try {
+        const records = await dns.promises.lookup(host, { all: true });
+        const v4s = records.filter((r) => r.family === 4);
+        const v6s = records.filter((r) => r.family === 6);
+        dnsDbg.hasIpv4 = v4s.length > 0;
+        dnsDbg.hasIpv6 = v6s.length > 0;
+        dnsDbg.ipv4Count = v4s.length;
+        dnsDbg.ipv6Count = v6s.length;
+        if (v6s[0]) {
+          dnsDbg.ipv6Sample = v6s[0].address;
+        }
+      } catch {
+        // Handled downstream during connection attempt
+      }
+    }
+
     // Helper to attempt connection
     const tryConnect = async (
-      config: PoolConfig
+      config: PostgresPoolConfig
     ): Promise<{ client: any; pool: Pool; serverVersion?: string }> => {
       const pool = new Pool({
         ...config,
         connectionTimeoutMillis: timeoutMs,
-      });
+        lookup: PostgresConnectionManager.createSmartLookup((addr, fam) => {
+          dnsDbg.resolvedIp = addr;
+          dnsDbg.resolvedFamily = fam;
+        }),
+      } as any);
 
       const client = await pool.connect();
       const versionRes = await client.query('SELECT version(), NOW()');
@@ -248,6 +368,8 @@ export class PostgresConnectionManager {
           port,
           database,
           provider: diagnostics.detectedProvider,
+          ipFamily: dnsDbg.resolvedFamily,
+          resolvedAddress: dnsDbg.resolvedIp || undefined,
         },
       };
     } catch (firstErr: any) {
@@ -285,14 +407,16 @@ export class PostgresConnectionManager {
               port,
               database,
               provider: diagnostics.detectedProvider,
+              ipFamily: dnsDbg.resolvedFamily,
+              resolvedAddress: dnsDbg.resolvedIp || undefined,
             },
           };
         } catch (retryErr: any) {
-          return this.formatErrorResult(retryErr, rawUrl, startTime, true, initialParse);
+          return this.formatErrorResult(retryErr, rawUrl, startTime, true, initialParse, dnsDbg);
         }
       }
 
-      return this.formatErrorResult(firstErr, rawUrl, startTime, retriedWithTls, initialParse);
+      return this.formatErrorResult(firstErr, rawUrl, startTime, retriedWithTls, initialParse, dnsDbg);
     }
   }
 
@@ -305,7 +429,8 @@ export class PostgresConnectionManager {
     rawUrl: string,
     startTime: number,
     retriedWithTls: boolean,
-    parsed: PostgresNormalizedResult
+    parsed: PostgresNormalizedResult,
+    dnsDbg?: { hasIpv4: boolean; hasIpv6: boolean; ipv6Sample?: string }
   ): PostgresVerificationResult {
     const rawMsg = err.message || '';
     const errCode = err.code || '';
@@ -314,7 +439,27 @@ export class PostgresConnectionManager {
 
     let userFriendlyMsg: string;
 
-    if (lower.includes('password authentication failed') || errCode === '28P01') {
+    // Check if failure is due to IPv6 unreachability in the deployment environment
+    const isIpv6RoutingError =
+      errCode === 'ENETUNREACH' ||
+      errCode === 'EHOSTUNREACH' ||
+      lower.includes('enetunreach') ||
+      lower.includes('ehostunreach') ||
+      lower.includes('network is unreachable') ||
+      lower.includes('no route to host') ||
+      (dnsDbg?.hasIpv6 && !dnsDbg?.hasIpv4 && (errCode === 'ECONNREFUSED' || lower.includes('econnrefused')));
+
+    if (isIpv6RoutingError) {
+      const maskedIp = dnsDbg?.ipv6Sample
+        ? `${dnsDbg.ipv6Sample.slice(0, 4)}...:${dnsDbg.ipv6Sample.split(':').pop()}`
+        : 'IPv6 endpoint';
+
+      if (parsed.host.includes('supabase.co') || parsed.host.includes('supabase.com')) {
+        userFriendlyMsg = `PostgreSQL host '${parsed.host}' resolved to an IPv6-only endpoint (${maskedIp}), but this deployment environment cannot route to IPv6 (ENETUNREACH). For Supabase databases, please use the IPv4 Connection Pooler URL (e.g., aws-0-[region].pooler.supabase.com:6543 or :5432) or enable IPv6 networking.`;
+      } else {
+        userFriendlyMsg = `PostgreSQL server at '${parsed.host}' only exposes an IPv6 address (${maskedIp}), which is unreachable from this environment's network. Please verify IPv4/IPv6 routing or use an IPv4-accessible database proxy.`;
+      }
+    } else if (lower.includes('password authentication failed') || errCode === '28P01') {
       userFriendlyMsg = `PostgreSQL authentication failed for user '${parsed.user}'. Please check the username, password, and database credentials.`;
     } else if (lower.includes('database') && lower.includes('does not exist') || errCode === '3D000') {
       userFriendlyMsg = `PostgreSQL database '${parsed.database}' does not exist on this server. Please verify the database name in your connection URL.`;
@@ -333,7 +478,12 @@ export class PostgresConnectionManager {
     } else if (lower.includes('self-signed certificate') || lower.includes('certificate')) {
       userFriendlyMsg = `PostgreSQL TLS certificate verification error. ONYX negotiates secure TLS connections compatible with cloud-hosted providers.`;
     } else {
-      userFriendlyMsg = `PostgreSQL connection failed: ${rawMsg}. Please verify connection details and cloud firewall rules.`;
+      // Clean any accidental credential leakage in raw driver messages
+      let sanitizedRaw = rawMsg;
+      if (parsed.poolConfig.password) {
+        sanitizedRaw = sanitizedRaw.replace(new RegExp(parsed.poolConfig.password as string, 'g'), '••••••••');
+      }
+      userFriendlyMsg = `PostgreSQL connection failed: ${sanitizedRaw}. Please verify connection details and cloud firewall rules.`;
     }
 
     return {
@@ -362,3 +512,4 @@ export class PostgresConnectionManager {
     return new Pool(parsed.poolConfig);
   }
 }
+
