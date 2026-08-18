@@ -1,1 +1,0 @@
-Dense vectors represent high-dimensional semantic embeddings projected into cosine space for similarity search.

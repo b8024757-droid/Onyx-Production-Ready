@@ -89,7 +89,7 @@ async function runSafe429DegradationTest() {
   // 6. Gemini Generation Check
   const ai = getGeminiClient();
   async function generateWithFallback(prompt: string): Promise<string> {
-    const models = ['gemini-2.5-flash', config.gemini.textModel].filter(Boolean);
+    const models = [config.gemini.textModel || 'gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'].filter(Boolean);
     for (const m of models) {
       try {
         const resp = await ai!.models.generateContent({

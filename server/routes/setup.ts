@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { Pool } from 'pg';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { GoogleGenAI } from '@google/genai';
+import { config } from '../config';
 import { dbService, UserCredentials } from '../db/database';
 import { CryptoService } from '../services/crypto-service';
 import { requireAuth } from '../middleware/auth';
@@ -91,9 +92,10 @@ setupRouter.post('/gemini', async (req: Request, res: Response) => {
     // Verify key with live Gemini API ping
     try {
       const ai = new GoogleGenAI({ apiKey: trimmedKey });
+      const verifyModel = config.gemini.textModel || 'gemini-3.6-flash';
       // Use countTokens as a lightweight verification endpoint
       await ai.models.countTokens({
-        model: 'gemini-2.5-flash',
+        model: verifyModel,
         contents: 'ping',
       });
     } catch (testErr: any) {
@@ -340,7 +342,8 @@ setupRouter.post('/test-connection', async (req: Request, res: Response) => {
 
       try {
         const ai = new GoogleGenAI({ apiKey });
-        await ai.models.countTokens({ model: 'gemini-2.5-flash', contents: 'ping' });
+        const verifyModel = config.gemini.textModel || 'gemini-3.6-flash';
+        await ai.models.countTokens({ model: verifyModel, contents: 'ping' });
         const latencyMs = Date.now() - startTime;
         return res.json({ connected: true, latencyMs, message: 'Gemini API connection healthy' });
       } catch (err: any) {

@@ -319,7 +319,7 @@ export const SettingsView: React.FC = () => {
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {[
-            { name: 'Gemini Generative Engine', status: 'Operational', desc: 'gemini-2.5-flash with grounded retrieval' },
+            { name: 'Gemini Generative Engine', status: 'Operational', desc: 'gemini-3.6-flash with grounded retrieval' },
             { name: 'Gemini Text Embeddings', status: 'Operational', desc: 'text-embedding-004 (768-dim dense vectors)' },
             { name: 'BM25 Sparse Search Engine', status: 'Operational', desc: 'Inverted lexical index with term frequency' },
             { name: 'Reciprocal Rank Fusion (RRF)', status: 'Operational', desc: 'Hybrid k=60 rank unification' },

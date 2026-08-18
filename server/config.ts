@@ -10,7 +10,7 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
-    textModel: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
+    textModel: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
     embeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2-preview',
     embeddingDimension: 768,
   },

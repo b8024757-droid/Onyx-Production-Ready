@@ -465,7 +465,7 @@ async function runTests() {
         'Neural Cross-Encoder Reranker',
         'Reranking',
         'PASS',
-        `Model: gemini-2.5-flash. Input: ${rrfCandidates.length} candidates, Output: ${reranked.length} candidates. Top candidate scored: ${reranked[0].neuralRerankScore.toFixed(3)}, Final score: ${reranked[0].finalScore.toFixed(3)} (${tRerank}ms).`,
+        `Model: gemini-3.6-flash. Input: ${rrfCandidates.length} candidates, Output: ${reranked.length} candidates. Top candidate scored: ${reranked[0].neuralRerankScore.toFixed(3)}, Final score: ${reranked[0].finalScore.toFixed(3)} (${tRerank}ms).`,
         tRerank
       );
     } else {

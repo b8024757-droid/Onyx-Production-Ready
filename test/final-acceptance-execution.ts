@@ -152,7 +152,7 @@ async function runLiveAcceptanceTest() {
   const genStart = Date.now();
   if (ai) {
     const stream = await ai.models.generateContentStream({
-      model: config.gemini.textModel || 'gemini-2.5-flash',
+      model: config.gemini.textModel || 'gemini-3.6-flash',
       contents: `System: Grounded assistant. Cite passages as [[01]].\n\nPassages:\n${pdfContext.promptContext}\n\nQuestion: ${pdfQuery}`,
       config: { temperature: 0.1 },
     });
@@ -241,7 +241,7 @@ async function runLiveAcceptanceTest() {
   const gen10KStart = Date.now();
   if (ai) {
     const stream = await ai.models.generateContentStream({
-      model: config.gemini.textModel || 'gemini-2.5-flash',
+      model: config.gemini.textModel || 'gemini-3.6-flash',
       contents: `System: Grounded assistant. Cite passages as [[01]].\n\nPassages:\n${context10K.promptContext}\n\nQuestion: ${query10K}`,
       config: { temperature: 0.1 },
     });
@@ -278,7 +278,7 @@ async function runLiveAcceptanceTest() {
   console.log(`10K document context size: ${context10KTokens} tokens (${context10KChars} chars)`);
   console.log(`percentage of source document sent to Gemini: ${percentageSent}%`);
   console.log(`actual BullMQ job ID: ${pdfJobId} / ${doc10KJobId}`);
-  console.log(`whether any fallback was used: No fallback used (pure BullMQ + Qdrant + BM25 + Gemini-Embedding-2 + Gemini-2.5-Flash)`);
+  console.log(`whether any fallback was used: No fallback used (pure BullMQ + Qdrant + BM25 + Gemini-Embedding-2 + Gemini-3.6-Flash)`);
 
   process.exit(0);
 }

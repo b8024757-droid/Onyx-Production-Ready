@@ -319,7 +319,7 @@ async function runVerification() {
         attempts++;
         const tGenStart = Date.now();
         const stream = await ai.models.generateContentStream({
-          model: config.gemini.textModel || 'gemini-2.5-flash',
+          model: config.gemini.textModel || 'gemini-3.6-flash',
           contents: prompt,
           config: { temperature: 0.1 },
         });
@@ -448,7 +448,7 @@ async function runVerification() {
         attempts++;
         const tGenStart = Date.now();
         const stream = await ai.models.generateContentStream({
-          model: config.gemini.textModel || 'gemini-2.5-flash',
+          model: config.gemini.textModel || 'gemini-3.6-flash',
           contents: prompt,
           config: { temperature: 0.1 },
         });
