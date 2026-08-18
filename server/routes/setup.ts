@@ -11,6 +11,7 @@ import { GoogleGenAI } from '@google/genai';
 import { config } from '../config';
 import { dbService, UserCredentials } from '../db/database';
 import { CryptoService } from '../services/crypto-service';
+import { PostgresConnectionManager } from '../services/postgres-connection-manager';
 import { requireAuth } from '../middleware/auth';
 import { SetupStatus } from '../../src/types';
 
@@ -242,33 +243,21 @@ setupRouter.post('/postgres', async (req: Request, res: Response) => {
 
     const trimmedUrl = connectionUrl.trim();
 
-    // Verify connection to PostgreSQL database
-    let testPool: Pool | null = null;
-    try {
-      testPool = new Pool({
-        connectionString: trimmedUrl,
-        connectionTimeoutMillis: 4000,
-      });
-      const client = await testPool.connect();
-      await client.query('SELECT NOW()');
-      client.release();
-      await testPool.end();
-    } catch (testErr: any) {
-      if (testPool) {
-        try {
-          await testPool.end();
-        } catch {}
-      }
+    // Verify connection to PostgreSQL database with automated TLS negotiation
+    const verification = await PostgresConnectionManager.verifyConnection(trimmedUrl);
+    if (!verification.success) {
       return res.status(400).json({
-        error: `PostgreSQL connection failed: ${testErr.message || 'Database unreachable'}. Please verify credentials and SSL settings.`,
+        error: verification.message,
+        diagnostics: verification.diagnostics,
       });
     }
 
-    const encUrl = CryptoService.encryptSecret(trimmedUrl);
+    const savedUrl = verification.normalizedUrl;
+    const encUrl = CryptoService.encryptSecret(savedUrl);
     creds.postgresUrlEncrypted = encUrl.encrypted;
     creds.postgresUrlIv = encUrl.iv;
     creds.postgresUrlTag = encUrl.tag;
-    creds.postgresUrlMasked = CryptoService.maskSecret(trimmedUrl, 'url');
+    creds.postgresUrlMasked = CryptoService.maskSecret(savedUrl, 'url');
     creds.postgresVerified = true;
     creds.currentSetupStep = 'ready';
     creds.updatedAt = new Date().toISOString();
@@ -277,7 +266,7 @@ setupRouter.post('/postgres', async (req: Request, res: Response) => {
 
     res.json({
       success: true,
-      message: 'PostgreSQL database connection verified and encrypted.',
+      message: verification.message,
       setupStatus: formatSetupStatus(userId, creds),
     });
   } catch (err: any) {
@@ -386,28 +375,21 @@ setupRouter.post('/test-connection', async (req: Request, res: Response) => {
           creds.postgresUrlIv,
           creds.postgresUrlTag
         );
+      } else if (config.database.url) {
+        connectionUrl = config.database.url;
       }
 
       if (!connectionUrl) {
         return res.json({ connected: false, latencyMs: 0, message: 'No custom PostgreSQL URL configured.' });
       }
 
-      let pool: Pool | null = null;
-      try {
-        pool = new Pool({ connectionString: connectionUrl, connectionTimeoutMillis: 3000 });
-        const client = await pool.connect();
-        await client.query('SELECT 1');
-        client.release();
-        await pool.end();
-        return res.json({ connected: true, latencyMs: Date.now() - startTime, message: 'PostgreSQL database connected' });
-      } catch (err: any) {
-        if (pool) {
-          try {
-            await pool.end();
-          } catch {}
-        }
-        return res.json({ connected: false, latencyMs: Date.now() - startTime, message: err.message });
-      }
+      const verifyRes = await PostgresConnectionManager.verifyConnection(connectionUrl, 4000);
+      return res.json({
+        connected: verifyRes.success,
+        latencyMs: verifyRes.latencyMs,
+        message: verifyRes.message,
+        diagnostics: verifyRes.diagnostics,
+      });
     }
 
     res.status(400).json({ error: 'Invalid target' });

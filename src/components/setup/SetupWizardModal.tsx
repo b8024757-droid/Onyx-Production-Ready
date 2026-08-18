@@ -142,8 +142,8 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({ isOpen, onCl
           setIsLoading(false);
           return;
         }
-        await api.setupPostgres({ connectionUrl: postgresUrl.trim() });
-        showToast('success', 'PostgreSQL Connected', 'Relational database connected.');
+        const res = await api.setupPostgres({ connectionUrl: postgresUrl.trim() });
+        showToast('success', 'PostgreSQL Connected', res.message || 'Relational database connected.');
       }
       await refreshSetupStatus();
       setStep(4);

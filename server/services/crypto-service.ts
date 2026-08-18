@@ -90,15 +90,18 @@ export class CryptoService {
 
     if (type === 'url') {
       try {
+        // Regex replacement preserves standard unicode bullets without URL percent-encoding artifacts
+        if (/:\/\/[^:]+:[^@]+@/.test(trimmed)) {
+          return trimmed.replace(/(:\/\/[^:]+:)([^@]+)(@)/, '$1••••••••$3');
+        }
         const url = new URL(trimmed);
         if (url.password) {
-          url.password = '••••••••';
-          return url.toString();
+          return `${url.protocol}//${url.username}:••••••••@${url.host}${url.pathname}${url.search}`;
         }
         return trimmed;
       } catch {
-        // Regex mask for postgresql://user:password@host/db
-        return trimmed.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:••••••••@');
+        // Fallback regex mask for postgresql://user:password@host/db
+        return trimmed.replace(/(:\/\/[^:]+:)([^@]+)(@)/, '$1••••••••$3');
       }
     }
 

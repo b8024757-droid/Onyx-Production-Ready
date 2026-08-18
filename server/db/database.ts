@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { config } from '../config';
 import { CryptoService } from '../services/crypto-service';
+import { PostgresConnectionManager } from '../services/postgres-connection-manager';
 import {
   Document,
   Chunk,
@@ -95,11 +96,12 @@ export class DatabaseService {
     // Initialize PostgreSQL connection pool if connection string exists
     if (config.database.url) {
       try {
+        const parsed = PostgresConnectionManager.parseAndNormalizeUrl(config.database.url);
         this.pool = new Pool({
-          connectionString: config.database.url,
+          ...parsed.poolConfig,
           max: 10,
           idleTimeoutMillis: 30000,
-          connectionTimeoutMillis: 3000,
+          connectionTimeoutMillis: 5000,
         });
       } catch (err: any) {
         this.lastError = err.message;
