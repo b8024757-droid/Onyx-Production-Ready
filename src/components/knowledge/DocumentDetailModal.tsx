@@ -7,7 +7,7 @@ import { Document, Chunk } from '../../types';
 import { api } from '../../services/api';
 import { useUI } from '../../context/UIContext';
 import { useChat } from '../../context/ChatContext';
-import { X, FileText, Layers, MessageSquare, ExternalLink, Calendar, Database, Trash2 } from 'lucide-react';
+import { X, FileText, Layers, MessageSquare, ExternalLink, Calendar, Database, Trash2, Zap, Clock } from 'lucide-react';
 import { getDocumentTypeBadge, formatBytes, formatRelativeTime } from '../../utils/formatters';
 import { Button } from '../common/Button';
 
@@ -103,6 +103,12 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({ docume
             <Calendar className="w-3.5 h-3.5 text-[#929892]" />
             <span>Added {new Date(document.createdAt).toLocaleDateString()}</span>
           </div>
+          {document.metrics && (
+            <div className="flex items-center gap-2 text-[#D6C7A1]">
+              <Zap className="w-3.5 h-3.5 text-[#D6C7A1]" />
+              <span>{document.metrics.deduplicated ? 'Instant Deduplicated' : `${document.metrics.totalTimeMs}ms total`}</span>
+            </div>
+          )}
           {document.sourceUrl && (
             <a
               href={document.sourceUrl}
@@ -115,6 +121,18 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({ docume
             </a>
           )}
         </div>
+
+        {/* Indexing Performance Breakdown (if available) */}
+        {document.metrics && !document.metrics.deduplicated && (
+          <div className="px-6 py-2.5 bg-[#121715] border-b border-[#2A302D] flex flex-wrap items-center gap-4 text-[11px] text-[#626863]">
+            <span className="text-[#929892] font-semibold">Indexing Latency:</span>
+            <span>Parse: <strong className="text-[#F3F1EA]">{document.metrics.parsingTimeMs}ms</strong></span>
+            <span>Chunk: <strong className="text-[#F3F1EA]">{document.metrics.chunkingTimeMs}ms</strong></span>
+            <span>Embed: <strong className="text-[#D6C7A1]">{document.metrics.embeddingTimeMs}ms</strong></span>
+            <span>Qdrant: <strong className="text-[#78C6A3]">{document.metrics.qdrantTimeMs}ms</strong></span>
+            <span>BM25: <strong className="text-[#78C6A3]">{document.metrics.bm25TimeMs}ms</strong></span>
+          </div>
+        )}
 
         {/* Content Chunks View */}
         <div className="flex-1 overflow-y-auto p-6 space-y-4">

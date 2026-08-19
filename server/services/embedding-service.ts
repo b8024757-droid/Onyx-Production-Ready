@@ -315,8 +315,8 @@ export class GeminiEmbeddingService implements IEmbeddingService {
       return results;
     }
 
-    // Process missing items in paced micro-batches to respect RPM quota
-    const concurrency = 2;
+    // Process missing items with controlled high-throughput concurrency and rate-limit backoff
+    const concurrency = 12;
     for (let i = 0; i < missingTexts.length; i += concurrency) {
       const batchSlice = missingTexts.slice(i, i + concurrency);
       const indexSlice = missingIndices.slice(i, i + concurrency);
@@ -330,10 +330,6 @@ export class GeminiEmbeddingService implements IEmbeddingService {
       });
 
       await Promise.all(batchPromises);
-
-      if (i + concurrency < missingTexts.length) {
-        await new Promise(r => setTimeout(r, 60));
-      }
     }
 
     this.lastLatencyMs = Date.now() - startTime;

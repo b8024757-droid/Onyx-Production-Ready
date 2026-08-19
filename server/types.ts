@@ -6,6 +6,7 @@ import {
   Document,
   DocumentStatus,
   DocumentType,
+  DocumentMetrics,
   Chunk,
   Collection,
   Conversation,
@@ -29,13 +30,7 @@ export interface IngestionResult {
   documentId: string;
   chunksCreated: number;
   status: DocumentStatus;
-  metrics: {
-    parsingTimeMs: number;
-    chunkingTimeMs: number;
-    embeddingTimeMs: number;
-    indexingTimeMs: number;
-    totalTimeMs: number;
-  };
+  metrics?: DocumentMetrics;
 }
 
 export interface VectorSearchParams {

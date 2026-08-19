@@ -545,10 +545,25 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     const seenSections = new Map<string, number>();
     const coveredFacets = new Set<string>();
 
-    // Pass 1: Ensure top candidate for each unique facet or structural section
+    // Pass 0: Always preserve top direct relevance candidates (top 3)
+    const sortedByScore = [...candidates].sort((a, b) => b.finalScore - a.finalScore);
+    for (let i = 0; i < Math.min(3, sortedByScore.length); i++) {
+      const cand = sortedByScore[i];
+      if (cand && cand.finalScore > 0.05) {
+        selected.push(cand);
+        seenChunkIds.add(cand.chunkId);
+        cand.matchedFacets?.forEach(f => coveredFacets.add(f));
+        if (cand.pageNumber) seenPages.set(cand.pageNumber, (seenPages.get(cand.pageNumber) || 0) + 1);
+        if (cand.sectionHeader) seenSections.set(cand.sectionHeader, (seenSections.get(cand.sectionHeader) || 0) + 1);
+      }
+    }
+
+    // Pass 1: Ensure candidate for each remaining unique facet or structural section
     const activeFacets = (facets || []).map(f => f.name);
 
     for (const facetName of activeFacets) {
+      if (selected.length >= topK) break;
+      if (coveredFacets.has(facetName)) continue;
       const match = candidates.find(c =>
         !seenChunkIds.has(c.chunkId) &&
         c.matchedFacets?.includes(facetName) &&
@@ -560,7 +575,6 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         coveredFacets.add(facetName);
         if (match.pageNumber) seenPages.set(match.pageNumber, (seenPages.get(match.pageNumber) || 0) + 1);
         if (match.sectionHeader) seenSections.set(match.sectionHeader, (seenSections.get(match.sectionHeader) || 0) + 1);
-        if (selected.length >= topK) break;
       }
     }
 
@@ -664,7 +678,8 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         'sections', 'section', 'explain', 'tell', 'outline', 'findings', 'results', 'result',
         'experiments', 'experiment', 'experimental', 'methodology', 'methods', 'method',
         'conclusion', 'conclusions', 'conclude', 'discussion', 'limitations', 'limitation',
-        'work', 'sentence', 'sentences', 'please', 'main', 'major', 'key', 'core'
+        'work', 'sentence', 'sentences', 'please', 'main', 'major', 'key', 'core',
+        'objective', 'objectives', 'purpose', 'covering', 'cover', 'aspects', 'details', 'points', 'bullet', 'bullets'
       ]);
 
       const specificTopicTerms = sigKeywords.filter(w => !GENERIC_META_WORDS.has(w));
@@ -680,7 +695,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         }
       }
 
-      const isCompletelyUnsupportedTopic = specificTopicTerms.length >= 2 && specificTopicMatches === 0;
+      const isCompletelyUnsupportedTopic = specificTopicTerms.length >= 2 && specificTopicMatches === 0 && facetCandidates.length === 0;
 
       const hasDocumentEvidence = facetCandidates.length >= 2 || (facetCandidates.length >= 1 && coveredPages.size >= 1);
 

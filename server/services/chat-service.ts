@@ -24,8 +24,9 @@ export class ChatService {
     const metrics: Partial<QueryMetrics> = {};
     const effectiveUserId = options.userId || 'user-default-admin';
 
-    // 1. Prepare conversation
+    // 1. Prepare conversation & retrieve prior messages
     let conversationId = options.conversationId;
+    let priorMessages: Message[] = [];
     if (!conversationId) {
       conversationId = `conv-${Date.now()}`;
       const newConv: Conversation = {
@@ -38,6 +39,8 @@ export class ChatService {
         updatedAt: new Date().toISOString(),
       };
       await dbService.saveConversation(newConv);
+    } else {
+      priorMessages = await dbService.getMessages(conversationId, effectiveUserId);
     }
 
     // Save user message
@@ -50,8 +53,17 @@ export class ChatService {
     };
     await dbService.addMessage(conversationId, userMessage, effectiveUserId);
 
-    // 2. Query Intent Classification & Multi-Facet Analysis
-    const intentAnalysis = rerankService.detectQueryIntent(query);
+    // 2. Query Intent Classification, Anaphora Context & Multi-Facet Analysis
+    let effectiveRetrievalQuery = query;
+    const anaphoraRegex = /\b(it|that|this|these|those|the other|the former|the latter|they|its|them|which one|why was it|compare that|what about|how about|explain that|the second|the first)\b/i;
+    if (priorMessages.length > 0 && (anaphoraRegex.test(query) || query.split(/\s+/).length <= 4)) {
+      const lastUserMsg = [...priorMessages].reverse().find(m => m.role === 'user');
+      if (lastUserMsg && lastUserMsg.content !== query) {
+        effectiveRetrievalQuery = `${lastUserMsg.content} ${query}`;
+      }
+    }
+
+    const intentAnalysis = rerankService.detectQueryIntent(effectiveRetrievalQuery);
     const isSummaryMode = intentAnalysis.isSummaryOrCrossSection;
     const candidateLimit = isSummaryMode ? 40 : (config.rag.topKCandidates || 20);
 
@@ -61,7 +73,7 @@ export class ChatService {
     let isVectorDegraded = false;
 
     try {
-      const queryVector = await vectorService.getEmbedding(query, { isQuery: true });
+      const queryVector = await vectorService.getEmbedding(effectiveRetrievalQuery, { isQuery: true });
       metrics.queryProcessingTimeMs = embedTimer.stop();
       metrics.vectorUnavailable = false;
 
@@ -88,7 +100,7 @@ export class ChatService {
 
     const bm25Timer = metricsService.startTimer();
     const keywordResults = await keywordService.search({
-      query,
+      query: effectiveRetrievalQuery,
       limit: candidateLimit,
       filter: {
         collectionId: options.collectionId,
@@ -288,9 +300,13 @@ RULES:
 4. If the provided context does not contain sufficient information to answer the question, clearly state: "The current knowledge base does not contain sufficient evidence to answer this question." Do not fabricate or invent facts.
 5. Structure your response with clear markdown headings, concise bullet points, and high information density.`;
 
+        const historyContext = priorMessages.length > 0
+          ? priorMessages.slice(-6).map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n')
+          : '';
+
         const prompt = `GROUNDED KNOWLEDGE EVIDENCE:
 ${grounded.promptContext}
-
+${historyContext ? `\nPRIOR CONVERSATION HISTORY:\n${historyContext}\n` : ''}
 ---
 
 USER QUESTION: "${query}"

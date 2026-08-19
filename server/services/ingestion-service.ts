@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { dbService } from '../db/database';
 import { DocumentParserService, NormalizedDocument, NormalizedSection } from '../parsers';
 import { storageService } from '../storage/storage-service';
@@ -6,7 +7,7 @@ import { vectorService } from './vector-service';
 import { keywordService } from './keyword-service';
 import { visualEvidenceService } from './visual-evidence-service';
 import { queueService, IngestionJobData } from './queue-service';
-import { Document, Chunk, DocumentType, DocumentCategory } from '../../src/types';
+import { Document, Chunk, DocumentType, DocumentCategory, DocumentMetrics } from '../../src/types';
 import { IngestionOptions, IngestionResult } from '../types';
 
 export class IngestionService {
@@ -25,6 +26,10 @@ export class IngestionService {
   ): Promise<{ jobId: string; documentId: string }> {
     const documentId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const userId = options.userId || 'user-default-admin';
+
+    // Compute SHA-256 Content Hash for duplicate detection
+    const contentHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
     // 1. Save file to persistent storage
     const storedFile = await storageService.saveFile(filename, fileBuffer, mimeType);
@@ -32,16 +37,84 @@ export class IngestionService {
     // 2. Determine collection name
     let collectionName: string | undefined;
     if (options.collectionId) {
-      const col = await dbService.getCollectionById(options.collectionId);
+      const col = await dbService.getCollectionById(options.collectionId, userId);
       if (col) collectionName = col.name;
     }
 
     const docType = this.determineDocumentType(filename, mimeType);
 
+    // Fast-path: Check for identical duplicate document already indexed for this user (Tenant Isolation Preserved)
+    const existingDuplicate = await dbService.findDocumentByHash(contentHash, userId);
+    if (existingDuplicate) {
+      const existingChunks = await dbService.getChunksForDocument(existingDuplicate.id, userId);
+      if (existingChunks.length > 0) {
+        console.log(`[IngestionService] Instant fast-path duplicate detected for user ${userId}. Reusing ${existingChunks.length} chunks from ${existingDuplicate.id}.`);
+        
+        const clonedChunks: Chunk[] = existingChunks.map(c => ({
+          ...c,
+          id: `chk-${documentId}-${c.chunkIndex}`,
+          documentId,
+          documentTitle: filename,
+          userId,
+        }));
+
+        keywordService.indexBatch(clonedChunks);
+        await dbService.saveChunks(clonedChunks);
+
+        const readyDoc: Document = {
+          id: documentId,
+          userId,
+          title: filename,
+          originalName: filename,
+          type: docType,
+          category: this.determineCategory(docType),
+          status: 'READY',
+          progress: 100,
+          statusMessage: `Successfully indexed (${clonedChunks.length} chunks - Deduplicated Instant Recall)`,
+          collectionId: options.collectionId,
+          collectionName,
+          contentHash,
+          chunkCount: clonedChunks.length,
+          sizeBytes: fileBuffer.length,
+          tags: options.tags || [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          metrics: {
+            parsingTimeMs: 1,
+            visualExtractionTimeMs: 0,
+            chunkingTimeMs: 0,
+            embeddingTimeMs: 0,
+            qdrantTimeMs: 0,
+            bm25TimeMs: 1,
+            databaseTimeMs: 1,
+            totalTimeMs: 3,
+            embeddingCalls: 0,
+            embeddingBatchSize: 0,
+            qdrantBatchSize: 0,
+            charCount: fileBuffer.length,
+            deduplicated: true,
+          },
+        };
+
+        await dbService.saveDocument(readyDoc);
+
+        if (options.collectionId) {
+          const col = await dbService.getCollectionById(options.collectionId, userId);
+          if (col) {
+            col.documentCount = (col.documentCount || 0) + 1;
+            col.updatedAt = new Date().toISOString();
+            await dbService.saveCollection(col);
+          }
+        }
+
+        return { jobId, documentId };
+      }
+    }
+
     // 3. Create initial Document record in DB
     const initialDoc: Document = {
       id: documentId,
-      userId: options.userId || 'user-default-admin',
+      userId,
       title: filename,
       originalName: filename,
       type: docType,
@@ -51,6 +124,7 @@ export class IngestionService {
       statusMessage: 'File uploaded and queued for processing',
       collectionId: options.collectionId,
       collectionName,
+      contentHash,
       chunkCount: 0,
       sizeBytes: fileBuffer.length,
       tags: options.tags || [],
@@ -63,7 +137,7 @@ export class IngestionService {
     // 4. Enqueue background processing job
     await queueService.addIngestionJob({
       jobId,
-      userId: options.userId || 'user-default-admin',
+      userId,
       documentId,
       filename,
       fileType: docType,
@@ -88,16 +162,19 @@ export class IngestionService {
   ): Promise<{ jobId: string; documentId: string }> {
     const documentId = `doc-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const jobId = `job-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const userId = options.userId || 'user-default-admin';
 
     let collectionName: string | undefined;
     if (options.collectionId) {
-      const col = await dbService.getCollectionById(options.collectionId);
+      const col = await dbService.getCollectionById(options.collectionId, userId);
       if (col) collectionName = col.name;
     }
 
+    const contentHash = crypto.createHash('sha256').update(url).digest('hex');
+
     const initialDoc: Document = {
       id: documentId,
-      userId: options.userId || 'user-default-admin',
+      userId,
       title: url,
       originalName: url,
       type: 'URL',
@@ -107,6 +184,7 @@ export class IngestionService {
       statusMessage: 'Web URL queued for crawling',
       collectionId: options.collectionId,
       collectionName,
+      contentHash,
       chunkCount: 0,
       sizeBytes: 0,
       sourceUrl: url,
@@ -119,7 +197,7 @@ export class IngestionService {
 
     await queueService.addIngestionJob({
       jobId,
-      userId: options.userId || 'user-default-admin',
+      userId,
       documentId,
       filename: url,
       fileType: 'URL',
@@ -135,6 +213,48 @@ export class IngestionService {
   }
 
   /**
+   * Re-run ingestion for a previously failed or existing document
+   */
+  public async retryDocumentIngestion(
+    documentId: string,
+    userId = 'user-default-admin'
+  ): Promise<{ jobId: string; documentId: string }> {
+    const doc = await dbService.getDocumentById(documentId, userId);
+    if (!doc) {
+      throw new Error(`Document ${documentId} not found`);
+    }
+
+    // Clean up partial vectors and chunks first
+    await vectorService.deleteDocumentVectors(documentId);
+    keywordService.removeDocument(documentId);
+
+    // Reset status
+    doc.status = 'UPLOADING';
+    doc.progress = 10;
+    doc.statusMessage = 'Retrying document indexing...';
+    doc.updatedAt = new Date().toISOString();
+    await dbService.saveDocument(doc);
+
+    const jobId = `job-retry-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    await queueService.addIngestionJob({
+      jobId,
+      userId,
+      documentId: doc.id,
+      filename: doc.originalName || doc.title,
+      fileType: doc.type,
+      fileSizeBytes: doc.sizeBytes || 0,
+      url: doc.sourceUrl,
+      collectionId: doc.collectionId,
+      tags: doc.tags,
+      chunkSize: 500,
+      chunkOverlap: 50,
+    });
+
+    return { jobId, documentId: doc.id };
+  }
+
+  /**
    * Worker processor executing full extraction, chunking, embedding, and indexing pipeline
    */
   private async processQueuedJob(
@@ -143,10 +263,14 @@ export class IngestionService {
   ): Promise<IngestionResult> {
     try {
       const startTime = Date.now();
+      const userId = data.userId || 'user-default-admin';
       let parsingTimeMs = 0;
+      let visualExtractionTimeMs = 0;
       let chunkingTimeMs = 0;
       let embeddingTimeMs = 0;
-      let indexingTimeMs = 0;
+      let qdrantTimeMs = 0;
+      let bm25TimeMs = 0;
+      let databaseTimeMs = 0;
 
       // --- STAGE 1: PARSING ---
       await updateProgress(25, 'Parsing document structure and extracting text');
@@ -175,8 +299,13 @@ export class IngestionService {
       }
       parsingTimeMs = Date.now() - parseStart;
 
-      // Update document title and structure
-      const doc = await dbService.getDocumentById(data.documentId);
+      // Calculate content hash for deduplication
+      const contentHash = rawFileBuffer
+        ? crypto.createHash('sha256').update(rawFileBuffer).digest('hex')
+        : crypto.createHash('sha256').update(parsedDoc.rawText || data.url || '').digest('hex');
+
+      // Update document record with title and metadata
+      const doc = await dbService.getDocumentById(data.documentId, userId);
       if (doc) {
         doc.title = parsedDoc.title || data.filename || data.url || 'Document';
         doc.type = parsedDoc.documentType;
@@ -184,13 +313,66 @@ export class IngestionService {
         doc.pageCount = parsedDoc.pageCount;
         doc.slideCount = parsedDoc.slideCount;
         doc.sectionCount = parsedDoc.sections.length;
+        doc.contentHash = contentHash;
         doc.summary = parsedDoc.sections[0]?.content.slice(0, 200);
         doc.contentPreview = parsedDoc.sections.slice(0, 3).map(s => s.content).join('\n\n').slice(0, 500);
         await dbService.saveDocument(doc);
       }
 
+      // Check for identical duplicate document already indexed for this user (Tenant Isolation Preserved)
+      const existingDuplicate = await dbService.findDocumentByHash(contentHash, userId);
+      if (existingDuplicate && existingDuplicate.id !== data.documentId) {
+        const existingChunks = await dbService.getChunksForDocument(existingDuplicate.id, userId);
+        if (existingChunks.length > 0) {
+          console.log(`[IngestionService] Duplicate detected for user ${userId}. Reusing ${existingChunks.length} chunks from ${existingDuplicate.id}.`);
+          await updateProgress(90, 'Reusing indexed vector embeddings from duplicate document...');
+
+          // Clone chunks for this document ID
+          const clonedChunks: Chunk[] = existingChunks.map(c => ({
+            ...c,
+            id: `chk-${data.documentId}-${c.chunkIndex}`,
+            documentId: data.documentId,
+            documentTitle: doc?.title || parsedDoc.title,
+            userId,
+          }));
+
+          // Index into keyword search and database
+          keywordService.indexBatch(clonedChunks);
+          await dbService.saveChunks(clonedChunks);
+
+          // Update doc status
+          if (doc) {
+            doc.status = 'READY';
+            doc.progress = 100;
+            doc.chunkCount = clonedChunks.length;
+            doc.statusMessage = `Successfully indexed (${clonedChunks.length} chunks - Deduplicated Instant Recall)`;
+            doc.updatedAt = new Date().toISOString();
+            doc.metrics = {
+              parsingTimeMs,
+              chunkingTimeMs: 0,
+              embeddingTimeMs: 0,
+              qdrantTimeMs: 0,
+              bm25TimeMs: 1,
+              databaseTimeMs: 1,
+              totalTimeMs: Date.now() - startTime,
+              deduplicated: true,
+              charCount: parsedDoc.rawText.length,
+            };
+            await dbService.saveDocument(doc);
+          }
+
+          await updateProgress(100, `Successfully indexed ${clonedChunks.length} chunks`);
+          return {
+            documentId: data.documentId,
+            chunksCreated: clonedChunks.length,
+            status: 'READY',
+            metrics: doc?.metrics,
+          };
+        }
+      }
+
       // --- STAGE 2: STRUCTURE-AWARE CHUNKING & MULTIMODAL EXTRACTION ---
-      await updateProgress(50, 'Segmenting text into structure-aware semantic chunks & extracting visual evidence');
+      await updateProgress(50, 'Segmenting text into structure-aware semantic chunks');
       const chunkStart = Date.now();
 
       const targetChunkSize = data.chunkSize || 500;
@@ -202,9 +384,11 @@ export class IngestionService {
         targetChunkSize,
         targetOverlap
       );
+      chunkingTimeMs = Date.now() - chunkStart;
 
       // Multimodal Visual Evidence Extraction for PDFs
       if (parsedDoc.documentType === 'PDF' && rawFileBuffer) {
+        const visStart = Date.now();
         try {
           const visualResult = await visualEvidenceService.extractPdfVisualEvidence(
             data.documentId,
@@ -219,9 +403,8 @@ export class IngestionService {
         } catch (visErr: any) {
           console.warn(`[IngestionService] Visual evidence extraction warning (non-fatal): ${visErr.message}`);
         }
+        visualExtractionTimeMs = Date.now() - visStart;
       }
-
-      chunkingTimeMs = Date.now() - chunkStart;
 
       if (chunks.length === 0) {
         throw new Error('No readable text content or visual evidence extracted from document.');
@@ -232,12 +415,15 @@ export class IngestionService {
       const embedStart = Date.now();
 
       const chunkTexts = chunks.map(c => c.content);
+      const teleBefore = embeddingService.getTelemetry();
       const vectors = await embeddingService.embedBatch(chunkTexts);
+      const teleAfter = embeddingService.getTelemetry();
+      embeddingTimeMs = Date.now() - embedStart;
 
       const vectorPoints = [];
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
-        chunk.userId = data.userId || 'user-default-admin';
+        chunk.userId = userId;
         const vector = vectors[i];
 
         vectorPoints.push({
@@ -255,58 +441,77 @@ export class IngestionService {
             collectionId: data.collectionId,
             sourceUrl: data.url,
             chunkIndex: chunk.chunkIndex,
-            userId: data.userId || 'user-default-admin',
+            userId,
           },
         });
       }
-      embeddingTimeMs = Date.now() - embedStart;
 
       // --- STAGE 4: INDEXING (Vector DB + BM25 + PostgreSQL) ---
       await updateProgress(90, 'Upserting vectors into Qdrant and building BM25 index');
-      const indexStart = Date.now();
 
-      // 1. Upsert vectors to Qdrant/VectorService
+      // 1. Upsert vectors to Qdrant
+      const qdrantStart = Date.now();
       await vectorService.upsertChunkVectors(vectorPoints);
+      qdrantTimeMs = Date.now() - qdrantStart;
 
       // 2. Index in BM25
-      for (const chk of chunks) {
-        keywordService.indexChunk(chk);
-      }
+      const bm25Start = Date.now();
+      keywordService.indexBatch(chunks);
+      bm25TimeMs = Date.now() - bm25Start;
 
-      // 3. Save chunks in PostgreSQL
+      // 3. Save chunks in DB
+      const dbStart = Date.now();
       await dbService.saveChunks(chunks);
+      databaseTimeMs = Date.now() - dbStart;
 
       // 4. Update Document record
       const totalTokens = chunks.reduce((sum, c) => sum + c.tokenCount, 0);
+      const totalTimeMs = Date.now() - startTime;
+
+      const metrics: DocumentMetrics = {
+        parsingTimeMs,
+        visualExtractionTimeMs,
+        chunkingTimeMs,
+        embeddingTimeMs,
+        qdrantTimeMs,
+        bm25TimeMs,
+        databaseTimeMs,
+        totalTimeMs,
+        embeddingCalls: teleAfter.totalEmbeddingsGenerated - teleBefore.totalEmbeddingsGenerated,
+        embeddingBatchSize: teleAfter.batchSize,
+        qdrantBatchSize: 100,
+        charCount: parsedDoc.rawText.length,
+        deduplicated: false,
+      };
+
       if (doc) {
         doc.status = 'READY';
         doc.progress = 100;
         doc.statusMessage = `Successfully indexed (${chunks.length} chunks)`;
         doc.chunkCount = chunks.length;
-        doc.userId = data.userId || doc.userId || 'user-default-admin';
+        doc.userId = userId;
         doc.updatedAt = new Date().toISOString();
+        doc.metrics = metrics;
         await dbService.saveDocument(doc);
       }
 
       // 5. Update collection document count
       if (data.collectionId) {
-        const col = await dbService.getCollectionById(data.collectionId, data.userId);
+        const col = await dbService.getCollectionById(data.collectionId, userId);
         if (col) {
           col.documentCount = (col.documentCount || 0) + 1;
           col.updatedAt = new Date().toISOString();
           await dbService.saveCollection(col);
         }
       }
-      indexingTimeMs = Date.now() - indexStart;
 
       // --- STAGE 5: READY ---
-      await updateProgress(100, `Successfully indexed ${chunks.length} chunks (${totalTokens} tokens)`);
-      const totalTimeMs = Date.now() - startTime;
+      await updateProgress(100, `Successfully indexed ${chunks.length} chunks (${totalTokens} tokens) in ${Math.round(totalTimeMs)}ms`);
 
       // Log Activity
       dbService.addActivity({
         id: `act-${Date.now()}`,
-        userId: data.userId || 'user-default-admin',
+        userId,
         type: 'index_complete',
         title: 'Document Ingestion Complete',
         description: `Indexed ${chunks.length} chunks into Qdrant & BM25 (${Math.round(totalTimeMs)}ms)`,
@@ -314,12 +519,12 @@ export class IngestionService {
         documentId: data.documentId,
       });
 
-      // Real Application Notification: Ready
+      // Application Notification: Ready
       const docName = doc?.title || data.filename || 'Document';
       const isMultimodal = chunks.some(c => c.metadata?.isVisual || c.id.includes('-vis-'));
       dbService.addNotification({
         id: `notif-ready-${data.documentId}`,
-        userId: data.userId || 'user-default-admin',
+        userId,
         type: 'SUCCESS',
         title: 'Document Ready',
         message: isMultimodal
@@ -335,13 +540,7 @@ export class IngestionService {
         documentId: data.documentId,
         chunksCreated: chunks.length,
         status: 'READY',
-        metrics: {
-          parsingTimeMs,
-          chunkingTimeMs,
-          embeddingTimeMs,
-          indexingTimeMs,
-          totalTimeMs,
-        },
+        metrics,
       };
     } catch (err: any) {
       console.error(`[IngestionService] Ingestion failed for document ${data.documentId}: ${err.message || err}`);

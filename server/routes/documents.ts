@@ -56,6 +56,67 @@ documentsRouter.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
+// GET /api/documents/:id/status
+documentsRouter.get('/:id/status', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const doc = await dbService.getDocumentById(req.params.id, userId);
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    res.json({
+      id: doc.id,
+      status: doc.status,
+      progress: doc.progress,
+      statusMessage: doc.statusMessage,
+      chunkCount: doc.chunkCount,
+      metrics: doc.metrics,
+      updatedAt: doc.updatedAt,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/documents/:id/metrics
+documentsRouter.get('/:id/metrics', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const doc = await dbService.getDocumentById(req.params.id, userId);
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    res.json({
+      documentId: doc.id,
+      title: doc.title,
+      type: doc.type,
+      status: doc.status,
+      metrics: doc.metrics || null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/documents/:id/retry
+documentsRouter.post('/:id/retry', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const doc = await dbService.getDocumentById(req.params.id, userId);
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    const result = await ingestionService.retryDocumentIngestion(doc.id, userId);
+    res.json({
+      message: 'Document indexing retry queued',
+      jobId: result.jobId,
+      documentId: result.documentId,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/documents/upload
 documentsRouter.post('/upload', upload.single('file'), async (req: Request, res: Response) => {
   try {

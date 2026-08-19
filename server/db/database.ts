@@ -434,6 +434,21 @@ export class DatabaseService {
     return doc;
   }
 
+  public async findDocumentByHash(contentHash: string, userId?: string): Promise<Document | null> {
+    if (!contentHash) return null;
+    for (const doc of this.documents.values()) {
+      if (doc.contentHash === contentHash && doc.status === 'READY') {
+        if (userId) {
+          const isOwner = doc.userId === userId || (!doc.userId && userId === 'user-default-admin');
+          if (isOwner) return doc;
+        } else {
+          return doc;
+        }
+      }
+    }
+    return null;
+  }
+
   public async saveDocument(doc: Document): Promise<Document> {
     this.documents.set(doc.id, doc);
     this.saveSnapshot();

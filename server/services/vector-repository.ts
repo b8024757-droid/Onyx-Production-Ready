@@ -126,16 +126,20 @@ export class VectorRepository {
       });
     }
 
-    if (this.isConnected && this.client) {
+    if (this.isConnected && this.client && points.length > 0) {
       try {
-        await this.client.upsert(this.collectionName, {
-          wait: true,
-          points: points.map((p, idx) => ({
-            id: typeof p.id === 'number' ? p.id : (Date.now() + idx),
-            vector: p.vector,
-            payload: p.payload,
-          })),
-        });
+        const batchSize = 100;
+        for (let i = 0; i < points.length; i += batchSize) {
+          const slice = points.slice(i, i + batchSize);
+          await this.client.upsert(this.collectionName, {
+            wait: true,
+            points: slice.map((p, idx) => ({
+              id: typeof p.id === 'number' ? p.id : (Date.now() + i + idx),
+              vector: p.vector,
+              payload: p.payload,
+            })),
+          });
+        }
       } catch (err: any) {
         console.warn(`[Qdrant] Upsert error: ${err.message}. Chunks retained in vector repository.`);
       }

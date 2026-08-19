@@ -34,29 +34,37 @@ export class KeywordService {
   }
 
   public indexChunk(chunk: Chunk): void {
-    const tokens = this.tokenize(chunk.content);
-    const length = Math.max(1, tokens.length);
+    this.indexBatch([chunk]);
+  }
 
-    this.chunkLengths.set(chunk.id, length);
-    this.totalLength += length;
-    this.totalChunks++;
+  public indexBatch(chunks: Chunk[]): void {
+    if (!chunks || chunks.length === 0) return;
 
-    const tfMap = new Map<string, number>();
-    for (const t of tokens) {
-      tfMap.set(t, (tfMap.get(t) || 0) + 1);
-    }
+    for (const chunk of chunks) {
+      const tokens = this.tokenize(chunk.content);
+      const length = Math.max(1, tokens.length);
 
-    for (const [term, tf] of tfMap.entries()) {
-      let entries = this.invertedIndex.get(term);
-      if (!entries) {
-        entries = [];
-        this.invertedIndex.set(term, entries);
+      this.chunkLengths.set(chunk.id, length);
+      this.totalLength += length;
+      this.totalChunks++;
+
+      const tfMap = new Map<string, number>();
+      for (const t of tokens) {
+        tfMap.set(t, (tfMap.get(t) || 0) + 1);
       }
-      entries.push({
-        chunkId: chunk.id,
-        tf,
-        docLength: length,
-      });
+
+      for (const [term, tf] of tfMap.entries()) {
+        let entries = this.invertedIndex.get(term);
+        if (!entries) {
+          entries = [];
+          this.invertedIndex.set(term, entries);
+        }
+        entries.push({
+          chunkId: chunk.id,
+          tf,
+          docLength: length,
+        });
+      }
     }
   }
 

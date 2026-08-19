@@ -237,13 +237,23 @@ Be strictly factual and thorough. Do not hallucinate elements not visible in the
     try {
       const renderedPages = this.renderPdfPagesToPng(pdfBuffer, tempDir, `doc_${documentId}`);
 
-      for (const page of renderedPages) {
-        try {
-          const imageBuffer = fs.readFileSync(page.filePath);
-          const pageFigures = await this.analyzePageImage(page.pageNumber, imageBuffer, documentTitle);
+      // Process page image analysis with controlled parallel concurrency
+      const pageConcurrency = 4;
+      for (let i = 0; i < renderedPages.length; i += pageConcurrency) {
+        const pageSlice = renderedPages.slice(i, i + pageConcurrency);
+        const results = await Promise.all(
+          pageSlice.map(async page => {
+            try {
+              const imageBuffer = fs.readFileSync(page.filePath);
+              return await this.analyzePageImage(page.pageNumber, imageBuffer, documentTitle);
+            } catch (pageErr: any) {
+              console.warn(`[VisualEvidenceService] Error processing page ${page.pageNumber}: ${pageErr.message}`);
+              return [];
+            }
+          })
+        );
+        for (const pageFigures of results) {
           allFigures.push(...pageFigures);
-        } catch (pageErr: any) {
-          console.warn(`[VisualEvidenceService] Error processing page ${page.pageNumber}: ${pageErr.message}`);
         }
       }
 
