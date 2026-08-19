@@ -250,6 +250,7 @@ async function measureDocumentIngestion(
     chunkCount: chunks.length,
     sizeBytes: rawBuffer.length,
     pageCount: parsedDoc.pageCount,
+    tags: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
