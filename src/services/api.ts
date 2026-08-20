@@ -234,15 +234,18 @@ export const api = {
   },
 
   // Resumable Chunked Streaming Upload Methods
-  async initChunkedUpload(payload: {
-    filename: string;
-    sizeBytes: number;
-    mimeType?: string;
-    chunkSize?: number;
-    clientSha256?: string;
-    collectionId?: string;
-    tags?: string[];
-  }): Promise<{
+  async initChunkedUpload(
+    payload: {
+      filename: string;
+      sizeBytes: number;
+      mimeType?: string;
+      chunkSize?: number;
+      clientSha256?: string;
+      collectionId?: string;
+      tags?: string[];
+    },
+    signal?: AbortSignal
+  ): Promise<{
     uploadId: string;
     filename: string;
     sizeBytes: number;
@@ -255,6 +258,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
+      signal,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Failed to init upload' }));
@@ -267,7 +271,8 @@ export const api = {
     uploadId: string,
     chunkIndex: number,
     chunkBlob: Blob,
-    sha256?: string
+    sha256?: string,
+    signal?: AbortSignal
   ): Promise<{
     uploadId: string;
     chunkIndex: number;
@@ -289,6 +294,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(headers),
       body: chunkBlob,
+      signal,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Chunk upload failed' }));
@@ -297,7 +303,7 @@ export const api = {
     return res.json();
   },
 
-  async getUploadStatus(uploadId: string): Promise<{
+  async getUploadStatus(uploadId: string, signal?: AbortSignal): Promise<{
     uploadId: string;
     filename: string;
     sizeBytes: number;
@@ -311,6 +317,7 @@ export const api = {
   }> {
     const res = await fetch(`/api/documents/upload/${uploadId}/status`, {
       headers: getAuthHeaders(),
+      signal,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Status fetch failed' }));
@@ -319,7 +326,7 @@ export const api = {
     return res.json();
   },
 
-  async completeChunkedUpload(uploadId: string): Promise<{
+  async completeChunkedUpload(uploadId: string, signal?: AbortSignal): Promise<{
     message: string;
     uploadId: string;
     documentId: string;
@@ -330,6 +337,7 @@ export const api = {
     const res = await fetch(`/api/documents/upload/${uploadId}/complete`, {
       method: 'POST',
       headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      signal,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Complete upload failed' }));
@@ -348,6 +356,161 @@ export const api = {
       throw new Error(err.error || 'Failed to abort upload session');
     }
     return res.json();
+  },
+
+  /**
+   * High-level streaming chunked uploader using native browser File/Blob slicing.
+   * Zero entire-file RAM overhead — only 5 MB slice loaded in memory at any time.
+   */
+  async uploadFileChunked(
+    file: File | Blob,
+    filename: string,
+    options?: {
+      chunkSize?: number;
+      collectionId?: string;
+      tags?: string[];
+      signal?: AbortSignal;
+      maxRetriesPerChunk?: number;
+      onProgress?: (progress: {
+        uploadId: string;
+        chunkIndex: number;
+        totalChunks: number;
+        uploadedBytes: number;
+        totalBytes: number;
+        percent: number;
+        stage: 'INIT' | 'UPLOADING' | 'ASSEMBLING';
+      }) => void;
+    }
+  ): Promise<{
+    message: string;
+    uploadId: string;
+    documentId: string;
+    jobId: string;
+    contentHash: string;
+    sizeBytes: number;
+  }> {
+    const sizeBytes = file.size;
+    const chunkSize = options?.chunkSize || 5 * 1024 * 1024; // 5 MB chunk size
+    const totalChunks = Math.max(1, Math.ceil(sizeBytes / chunkSize));
+    const mimeType = (file as File).type || 'application/octet-stream';
+
+    if (options?.signal?.aborted) {
+      throw new Error('Upload aborted');
+    }
+
+    options?.onProgress?.({
+      uploadId: '',
+      chunkIndex: 0,
+      totalChunks,
+      uploadedBytes: 0,
+      totalBytes: sizeBytes,
+      percent: 0,
+      stage: 'INIT',
+    });
+
+    const initRes = await this.initChunkedUpload(
+      {
+        filename,
+        sizeBytes,
+        mimeType,
+        chunkSize,
+        collectionId: options?.collectionId,
+        tags: options?.tags,
+      },
+      options?.signal
+    );
+
+    const uploadId = initRes.uploadId;
+    let uploadedBytes = 0;
+
+    try {
+      for (let i = 0; i < totalChunks; i++) {
+        if (options?.signal?.aborted) {
+          await this.abortChunkedUpload(uploadId).catch(() => {});
+          throw new Error('Upload aborted by user');
+        }
+
+        const start = i * chunkSize;
+        const end = Math.min(sizeBytes, start + chunkSize);
+        // Native Blob.slice — Zero RAM footprint (references underlying disk/file descriptor)
+        const chunkBlob = file.slice(start, end);
+
+        // Compute client SHA-256 per 5MB chunk in-flight via Web Crypto
+        let chunkSha256: string | undefined;
+        try {
+          if (typeof crypto !== 'undefined' && crypto.subtle) {
+            const chunkBuf = await chunkBlob.arrayBuffer();
+            const digest = await crypto.subtle.digest('SHA-256', chunkBuf);
+            chunkSha256 = Array.from(new Uint8Array(digest))
+              .map(b => b.toString(16).padStart(2, '0'))
+              .join('');
+          }
+        } catch {
+          // Non-blocking if subtle crypto unavailable
+        }
+
+        // Retry loop for individual chunk failure resilience
+        const maxRetries = options?.maxRetriesPerChunk ?? 3;
+        let attempt = 0;
+        let success = false;
+        let lastError: any = null;
+
+        while (attempt <= maxRetries && !success) {
+          if (options?.signal?.aborted) {
+            await this.abortChunkedUpload(uploadId).catch(() => {});
+            throw new Error('Upload aborted by user');
+          }
+
+          try {
+            await this.uploadChunk(uploadId, i, chunkBlob, chunkSha256, options?.signal);
+            success = true;
+          } catch (err: any) {
+            attempt++;
+            lastError = err;
+            if (attempt <= maxRetries && !options?.signal?.aborted) {
+              const backoffMs = Math.min(500 * Math.pow(2, attempt - 1), 3000);
+              await new Promise(r => setTimeout(r, backoffMs));
+            }
+          }
+        }
+
+        if (!success) {
+          await this.abortChunkedUpload(uploadId).catch(() => {});
+          throw lastError || new Error(`Failed to upload chunk ${i + 1} after ${maxRetries} retries`);
+        }
+
+        uploadedBytes = end;
+        const percent = Math.min(100, Math.round((uploadedBytes / sizeBytes) * 100));
+
+        options?.onProgress?.({
+          uploadId,
+          chunkIndex: i + 1,
+          totalChunks,
+          uploadedBytes,
+          totalBytes: sizeBytes,
+          percent,
+          stage: 'UPLOADING',
+        });
+      }
+
+      options?.onProgress?.({
+        uploadId,
+        chunkIndex: totalChunks,
+        totalChunks,
+        uploadedBytes: sizeBytes,
+        totalBytes: sizeBytes,
+        percent: 100,
+        stage: 'ASSEMBLING',
+      });
+
+      const completeRes = await this.completeChunkedUpload(uploadId, options?.signal);
+      return completeRes;
+    } catch (err: any) {
+      if (uploadId) {
+        await this.abortChunkedUpload(uploadId).catch(() => {});
+      }
+      throw err;
+    }
   },
 
   async deleteDocument(id: string): Promise<{ success: boolean }> {

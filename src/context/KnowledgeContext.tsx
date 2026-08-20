@@ -35,7 +35,8 @@ interface KnowledgeContextType {
   refreshData: () => Promise<void>;
   uploadKnowledge: (payload: {
     name: string;
-    content: string;
+    content?: string;
+    file?: File | Blob;
     type: string;
     sizeBytes: number;
     sourceUrl?: string;
@@ -116,14 +117,32 @@ export const KnowledgeProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const uploadKnowledge = async (payload: {
     name: string;
-    content: string;
+    content?: string;
+    file?: File | Blob;
     type: string;
     sizeBytes: number;
     sourceUrl?: string;
     collectionId?: string;
     tags?: string[];
   }): Promise<string> => {
-    const res = await api.uploadDocument(payload);
+    let res: { jobId: string; documentId: string };
+    if (payload.file) {
+      res = await api.uploadFileChunked(payload.file, payload.name, {
+        collectionId: payload.collectionId,
+        tags: payload.tags,
+      });
+    } else {
+      res = await api.uploadDocument({
+        name: payload.name,
+        content: payload.content || '',
+        type: payload.type,
+        sizeBytes: payload.sizeBytes,
+        sourceUrl: payload.sourceUrl,
+        collectionId: payload.collectionId,
+        tags: payload.tags,
+      });
+    }
+
     // Add temporary active job tracker
     const tempJob: ProcessingJob = {
       id: res.jobId,

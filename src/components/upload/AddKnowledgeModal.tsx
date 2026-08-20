@@ -325,8 +325,8 @@ export const AddKnowledgeModal: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'files' | 'web'>('files');
   const [isDragging, setIsDragging] = useState(false);
   const [selectedFile, setSelectedFile] = useState<{
+    file: File;
     name: string;
-    content: string;
     type: DocumentType;
     sizeBytes: number;
   } | null>(null);
@@ -335,6 +335,7 @@ export const AddKnowledgeModal: React.FC = () => {
   const [selectedCollectionId, setSelectedCollectionId] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const activeUploadAbortRef = useRef<AbortController | null>(null);
 
   // Active Indexing Progress Tracking State
   const [currentJob, setCurrentJob] = useState<ProcessingJob | null>(null);
@@ -343,6 +344,16 @@ export const AddKnowledgeModal: React.FC = () => {
   const [startTime, setStartTime] = useState<number | null>(null);
   const [isRetrying, setIsRetrying] = useState(false);
   const [visualElementCount, setVisualElementCount] = useState<number>(0);
+
+  // Cleanup active upload on unmount
+  useEffect(() => {
+    return () => {
+      if (activeUploadAbortRef.current) {
+        activeUploadAbortRef.current.abort();
+        activeUploadAbortRef.current = null;
+      }
+    };
+  }, []);
 
   // Live Timer Effect — accurate to 50ms intervals
   useEffect(() => {
@@ -359,7 +370,7 @@ export const AddKnowledgeModal: React.FC = () => {
 
   // Live Document Status Poller
   useEffect(() => {
-    if (!currentJob || currentJob.status === 'READY' || currentJob.status === 'FAILED') {
+    if (!currentJob || currentJob.status === 'READY' || currentJob.status === 'FAILED' || currentJob.status === 'UPLOADING') {
       if (currentJob?.status === 'READY' || currentJob?.status === 'FAILED') {
         setTimerActive(false);
       }
@@ -426,7 +437,6 @@ export const AddKnowledgeModal: React.FC = () => {
   };
 
   const processFileInput = (file: File) => {
-    const reader = new FileReader();
     const extension = file.name.split('.').pop()?.toUpperCase() || 'TXT';
     let docType: DocumentType = 'TXT';
     if (['PDF', 'DOC', 'DOCX', 'PPT', 'PPTX', 'TXT', 'MD', 'CSV', 'XLS', 'XLSX', 'HTML'].includes(extension)) {
@@ -435,29 +445,24 @@ export const AddKnowledgeModal: React.FC = () => {
       docType = 'IMAGE';
     }
 
-    if (['PDF', 'DOC', 'DOCX', 'PPT', 'PPTX', 'XLS', 'XLSX', 'IMAGE'].includes(docType)) {
-      reader.onload = e => {
-        const content = e.target?.result as string;
-        setSelectedFile({
-          name: file.name,
-          content: content || '',
-          type: docType,
-          sizeBytes: file.size,
-        });
-      };
-      reader.readAsDataURL(file);
-    } else {
-      reader.onload = e => {
-        const content = e.target?.result as string;
-        setSelectedFile({
-          name: file.name,
-          content: content || '',
-          type: docType,
-          sizeBytes: file.size,
-        });
-      };
-      reader.readAsText(file);
+    if (file.size <= 0) {
+      showToast('error', 'Invalid File', 'Selected file is empty (0 bytes).');
+      return;
     }
+
+    const maxBytes = 250 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      showToast('error', 'File Too Large', `File size (${(file.size / 1024 / 1024).toFixed(1)} MB) exceeds 250 MB limit.`);
+      return;
+    }
+
+    // Zero-RAM file selection — retain File handle without reading bytes into memory
+    setSelectedFile({
+      file,
+      name: file.name,
+      type: docType,
+      sizeBytes: file.size,
+    });
   };
 
   const handleImport = async () => {
@@ -470,25 +475,59 @@ export const AddKnowledgeModal: React.FC = () => {
 
     try {
       if (activeTab === 'files' && selectedFile) {
-        const payload = {
-          name: selectedFile.name,
-          content: selectedFile.content,
-          type: selectedFile.type,
-          sizeBytes: selectedFile.sizeBytes,
-          collectionId: selectedCollectionId || undefined,
-        };
+        const abortController = new AbortController();
+        activeUploadAbortRef.current = abortController;
 
-        const res = await api.uploadDocument(payload);
+        const totalChunks = Math.max(1, Math.ceil(selectedFile.sizeBytes / (5 * 1024 * 1024)));
+
         setCurrentJob({
-          id: res.jobId,
-          documentId: res.documentId,
+          id: 'upload-init',
+          documentId: '',
           fileName: selectedFile.name,
           fileType: selectedFile.type,
           fileSizeBytes: selectedFile.sizeBytes,
-          status: 'PARSING',
-          progress: 20,
-          stepMessage: 'Reading document stream and extracting content...',
+          status: 'UPLOADING',
+          progress: 5,
+          stepMessage: `Preparing chunked streaming upload (0/${totalChunks} chunks)...`,
           startedAt: new Date().toISOString(),
+        });
+
+        // Native File/Blob slicing upload: 5 MB binary chunks, zero base64, zero whole-file RAM
+        const uploadRes = await api.uploadFileChunked(selectedFile.file, selectedFile.name, {
+          chunkSize: 5 * 1024 * 1024,
+          collectionId: selectedCollectionId || undefined,
+          signal: abortController.signal,
+          onProgress: p => {
+            setCurrentJob(prev => {
+              if (!prev) return null;
+              const msg =
+                p.stage === 'ASSEMBLING'
+                  ? 'Assembling chunks on server & verifying SHA-256 integrity...'
+                  : `Uploading chunk ${p.chunkIndex} of ${p.totalChunks} (${p.percent}%)...`;
+              // Map upload progress from 5% to 20% of total pipeline
+              const mappedProgress = Math.min(20, 5 + Math.round((p.uploadedBytes / Math.max(1, p.totalBytes)) * 15));
+              return {
+                ...prev,
+                status: 'UPLOADING',
+                progress: mappedProgress,
+                stepMessage: msg,
+              };
+            });
+          },
+        });
+
+        activeUploadAbortRef.current = null;
+
+        setCurrentJob(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            id: uploadRes.jobId,
+            documentId: uploadRes.documentId,
+            status: 'PARSING',
+            progress: 20,
+            stepMessage: 'Reading document stream and extracting content...',
+          };
         });
       } else if (activeTab === 'web' && webUrl.trim()) {
         const title = webTitle.trim() || webUrl.replace(/^https?:\/\//, '');
@@ -516,7 +555,19 @@ export const AddKnowledgeModal: React.FC = () => {
       }
     } catch (e: any) {
       setTimerActive(false);
-      showToast('error', 'Import Failed', sanitizeErrorMessage(e.message));
+      activeUploadAbortRef.current = null;
+      if (e.message !== 'Upload aborted by user') {
+        showToast('error', 'Import Failed', sanitizeErrorMessage(e.message));
+      }
+      setCurrentJob(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          status: 'FAILED',
+          error: e.message,
+          stepMessage: sanitizeErrorMessage(e.message),
+        };
+      });
     } finally {
       setIsSubmitting(false);
     }
@@ -673,7 +724,12 @@ export const AddKnowledgeModal: React.FC = () => {
             </p>
           </div>
           <button
-            onClick={closeAddKnowledge}
+            onClick={() => {
+              if (currentJob?.status === 'UPLOADING') {
+                activeUploadAbortRef.current?.abort();
+              }
+              closeAddKnowledge();
+            }}
             aria-label="Close dialog"
             className="p-1.5 text-[#929892] hover:text-[#F3F1EA] rounded-lg hover:bg-[#171C1A] transition-colors"
           >
@@ -768,10 +824,12 @@ export const AddKnowledgeModal: React.FC = () => {
                       <UploadCloud className="w-6 h-6" />
                     </div>
                     <p className="text-sm font-semibold text-[#F3F1EA]">
-                      {selectedFile ? selectedFile.name : 'Click to upload or drag and drop'}
+                      {selectedFile
+                        ? `${selectedFile.name} (${formatBytes(selectedFile.sizeBytes)})`
+                        : 'Click to upload or drag and drop'}
                     </p>
                     <p className="text-xs text-[#929892] mt-1">
-                      PDF, DOCX, PPTX, XLSX, CSV, MD, TXT (max. 50MB)
+                      PDF, DOCX, PPTX, XLSX, CSV, MD, TXT, images (up to 250 MB)
                     </p>
                   </div>
                 </div>
@@ -1045,9 +1103,24 @@ export const AddKnowledgeModal: React.FC = () => {
 
             {/* Footer Action Controls */}
             <div className="pt-2 flex items-center justify-between border-t border-[#2A302D]">
-              <Button variant="ghost" size="sm" onClick={handleResetForAnother}>
-                + Add Another Document
-              </Button>
+              {currentJob.status === 'UPLOADING' ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    activeUploadAbortRef.current?.abort();
+                    handleResetForAnother();
+                    showToast('info', 'Upload Cancelled', 'The chunked upload was stopped.');
+                  }}
+                  className="text-[#E07A5F] hover:text-[#E07A5F] hover:bg-[#E07A5F]/10"
+                >
+                  Cancel Upload
+                </Button>
+              ) : (
+                <Button variant="ghost" size="sm" onClick={handleResetForAnother}>
+                  + Add Another Document
+                </Button>
+              )}
 
               <div className="flex items-center gap-2">
                 {currentJob.status === 'READY' && (
@@ -1064,7 +1137,12 @@ export const AddKnowledgeModal: React.FC = () => {
                 <Button
                   variant="champagne"
                   size="sm"
-                  onClick={closeAddKnowledge}
+                  onClick={() => {
+                    if (currentJob.status === 'UPLOADING') {
+                      activeUploadAbortRef.current?.abort();
+                    }
+                    closeAddKnowledge();
+                  }}
                   icon={<ArrowRight className="w-3.5 h-3.5" />}
                 >
                   {currentJob.status === 'READY' ? 'View in Knowledge Base' : 'Close'}
