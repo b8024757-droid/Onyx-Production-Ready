@@ -8,7 +8,7 @@ export class ContextService {
    */
   public static buildGroundedContext(
     candidates: RerankedCandidate[],
-    maxTokens = 3500
+    maxTokens = 6000
   ): GroundedContext {
     const citations: Citation[] = [];
     const chunks: Chunk[] = [];
@@ -28,8 +28,8 @@ export class ContextService {
       seenContentHashes.add(normalizedContent);
 
       const chunkTokens = Math.ceil(cand.content.length / 4);
-      if (currentTokenEstimate + chunkTokens > maxTokens && sourceBlocks.length >= 2) {
-        break; // Respect token budget
+      if (currentTokenEstimate + chunkTokens > maxTokens && sourceBlocks.length >= 4) {
+        break; // Respect token budget while ensuring broad coverage
       }
 
       const citationIndex = sourceBlocks.length + 1;
@@ -41,8 +41,35 @@ export class ContextService {
       if (cand.slideNumber) header += ` | Slide: ${cand.slideNumber}`;
       if (cand.sectionHeader) header += ` | Section: ${cand.sectionHeader}`;
 
-      sourceBlocks.push(`${header}\n${cand.content}`);
-      currentTokenEstimate += chunkTokens + 20;
+      let blockContent = cand.content;
+
+      // Enrich with visual elements if present
+      if (cand.isVisual || cand.metadata?.isVisual) {
+        const vType = cand.visualType || cand.metadata?.figureType || cand.metadata?.visualType || 'Figure';
+        const fId = cand.figureId || cand.metadata?.figureId;
+        const fTitle = cand.figureTitle || cand.metadata?.figureTitle;
+        const trend = cand.trendSummary || cand.metadata?.trendSummary;
+        const axes = cand.axes || cand.metadata?.axes;
+        const legend = cand.legend || cand.metadata?.legend;
+        const keyVals = cand.keyValues || cand.metadata?.keyValues;
+
+        header += ` | Visual Type: ${vType}`;
+        if (fId) header += ` | Figure ID: ${fId}`;
+        if (fTitle) header += ` | Figure Title: ${fTitle}`;
+
+        const visualDetails: string[] = [];
+        if (trend) visualDetails.push(`[Visual Finding / Trend]: ${trend}`);
+        if (axes && (axes.x || axes.y)) visualDetails.push(`[Axes]: X: ${axes.x || 'N/A'}, Y: ${axes.y || 'N/A'}`);
+        if (legend && legend.length > 0) visualDetails.push(`[Legend]: ${legend.join(', ')}`);
+        if (keyVals && keyVals.length > 0) visualDetails.push(`[Key Data Points]: ${keyVals.join(', ')}`);
+
+        if (visualDetails.length > 0) {
+          blockContent += `\n${visualDetails.join('\n')}`;
+        }
+      }
+
+      sourceBlocks.push(`${header}\n${blockContent}`);
+      currentTokenEstimate += chunkTokens + 30;
 
       // Create Citation object for frontend Evidence Inspector
       const citation: Citation = {

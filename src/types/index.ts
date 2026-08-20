@@ -126,6 +126,7 @@ export interface Document {
   tags: string[];
   summary?: string;
   author?: string;
+  storagePath?: string;
   createdAt: string;
   updatedAt: string;
   contentPreview?: string;
@@ -210,13 +211,10 @@ export interface ProcessingJob {
   startedAt: string;
   completedAt?: string;
   error?: string;
-  metrics?: {
-    parsingTimeMs?: number;
-    chunkingTimeMs?: number;
-    embeddingTimeMs?: number;
-    indexingTimeMs?: number;
-    totalTimeMs?: number;
-  };
+  chunkCount?: number;
+  pageCount?: number;
+  visualElementCount?: number;
+  metrics?: DocumentMetrics;
 }
 
 export interface AppNotification {

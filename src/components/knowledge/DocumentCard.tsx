@@ -1,11 +1,11 @@
 /**
- * Second Brain — Document Card Component
+ * Second Brain — Document Card Component with ONYX Status & Indexing Metadata
  */
 
 import React from 'react';
 import { Document } from '../../types';
-import { getDocumentTypeBadge, formatBytes, formatRelativeTime } from '../../utils/formatters';
-import { FileText, MoreVertical, Trash2, ExternalLink } from 'lucide-react';
+import { getDocumentTypeBadge, formatRelativeTime } from '../../utils/formatters';
+import { Trash2, CheckCircle2, Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
 interface DocumentCardProps {
   document: Document;
@@ -16,6 +16,18 @@ interface DocumentCardProps {
 export const DocumentCard: React.FC<DocumentCardProps> = ({ document, onSelect, onDelete }) => {
   const badge = getDocumentTypeBadge(document.type);
 
+  // Format indexing timing
+  const formatIndexingTime = () => {
+    if (!document.metrics) return null;
+    if (document.metrics.deduplicated) return 'Instant';
+    if (document.metrics.totalTimeMs) {
+      return `${(document.metrics.totalTimeMs / 1000).toFixed(1)}s`;
+    }
+    return null;
+  };
+
+  const indexingTimeStr = formatIndexingTime();
+
   return (
     <div
       onClick={() => onSelect(document)}
@@ -24,12 +36,32 @@ export const DocumentCard: React.FC<DocumentCardProps> = ({ document, onSelect, 
       <div>
         {/* Top Header */}
         <div className="flex items-start justify-between gap-3">
-          <span
-            className="text-[11px] font-bold px-2 py-0.5 rounded-md"
-            style={{ color: badge.color, backgroundColor: badge.bg }}
-          >
-            {badge.label}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className="text-[11px] font-bold px-2 py-0.5 rounded-md"
+              style={{ color: badge.color, backgroundColor: badge.bg }}
+            >
+              {badge.label}
+            </span>
+
+            {/* Status Pill */}
+            {document.status === 'READY' ? (
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[#78C6A3] bg-[#78C6A3]/10 px-2 py-0.5 rounded-md">
+                <CheckCircle2 className="w-3 h-3 text-[#78C6A3]" />
+                Ready
+              </span>
+            ) : document.status === 'FAILED' ? (
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[#E07A5F] bg-[#E07A5F]/10 px-2 py-0.5 rounded-md">
+                <AlertCircle className="w-3 h-3 text-[#E07A5F]" />
+                Failed
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[#D6C7A1] bg-[#D6C7A1]/10 px-2 py-0.5 rounded-md">
+                <Loader2 className="w-3 h-3 text-[#D6C7A1] animate-spin" />
+                Indexing
+              </span>
+            )}
+          </div>
 
           <button
             onClick={e => {
@@ -54,10 +86,26 @@ export const DocumentCard: React.FC<DocumentCardProps> = ({ document, onSelect, 
 
       {/* Footer Metadata */}
       <div className="mt-4 pt-3 border-t border-[#2A302D] flex items-center justify-between text-[11px] text-[#626863]">
-        <div className="flex items-center gap-2">
-          <span>{document.collectionName || 'General'}</span>
-          <span>·</span>
-          <span>{document.chunkCount || 1} units</span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[#929892]">{document.chunkCount || 1} chunks</span>
+          {document.pageCount && (
+            <>
+              <span>·</span>
+              <span>{document.pageCount} pages</span>
+            </>
+          )}
+          {document.slideCount && (
+            <>
+              <span>·</span>
+              <span>{document.slideCount} slides</span>
+            </>
+          )}
+          {indexingTimeStr && (
+            <>
+              <span>·</span>
+              <span className="text-[#D6C7A1]">{indexingTimeStr}</span>
+            </>
+          )}
         </div>
         <span>{formatRelativeTime(document.createdAt)}</span>
       </div>

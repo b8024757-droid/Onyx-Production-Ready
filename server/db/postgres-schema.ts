@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Users Table
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id VARCHAR(255) PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
     avatar_url TEXT,
@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Collections Table
 CREATE TABLE IF NOT EXISTS collections (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) REFERENCES users(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     description TEXT,
     tags TEXT[],
@@ -30,9 +30,9 @@ CREATE TABLE IF NOT EXISTS collections (
 
 -- Documents Table
 CREATE TABLE IF NOT EXISTS documents (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
+    id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) REFERENCES users(id) ON DELETE CASCADE,
+    collection_id VARCHAR(255) REFERENCES collections(id) ON DELETE SET NULL,
     title VARCHAR(500) NOT NULL,
     original_name VARCHAR(500) NOT NULL,
     document_type VARCHAR(50) NOT NULL,
@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS documents (
 
 -- Chunks Table (Metadata & text stored in PG; high-dim vectors stored in Qdrant)
 CREATE TABLE IF NOT EXISTS chunks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
+    id VARCHAR(255) PRIMARY KEY,
+    document_id VARCHAR(255) REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
     token_count INTEGER NOT NULL,
@@ -69,18 +69,18 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 -- Conversations Table
 CREATE TABLE IF NOT EXISTS conversations (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) REFERENCES users(id) ON DELETE CASCADE,
     title VARCHAR(500) NOT NULL,
-    collection_scope_id UUID REFERENCES collections(id) ON DELETE SET NULL,
+    collection_scope_id VARCHAR(255) REFERENCES collections(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Messages Table
 CREATE TABLE IF NOT EXISTS messages (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+    id VARCHAR(255) PRIMARY KEY,
+    conversation_id VARCHAR(255) REFERENCES conversations(id) ON DELETE CASCADE,
     role VARCHAR(20) NOT NULL,
     content TEXT NOT NULL,
     citations JSONB,
@@ -89,8 +89,8 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Processing Jobs Table
 CREATE TABLE IF NOT EXISTS processing_jobs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
+    id VARCHAR(255) PRIMARY KEY,
+    document_id VARCHAR(255) REFERENCES documents(id) ON DELETE CASCADE,
     file_name VARCHAR(500) NOT NULL,
     file_type VARCHAR(50) NOT NULL,
     file_size_bytes BIGINT NOT NULL,

@@ -41,7 +41,7 @@ export interface IEmbeddingService {
 export class GeminiEmbeddingService implements IEmbeddingService {
   private dimension = config.gemini.embeddingDimension || 768;
   private primaryModel = config.gemini.embeddingModel || 'gemini-embedding-2-preview';
-  private fallbackModels = ['gemini-embedding-2-preview', 'text-embedding-004'];
+  private fallbackModels = ['gemini-embedding-2-preview', 'text-embedding-004', 'embedding-001'];
   private currentActiveModel = 'gemini-embedding-2-preview';
   private batchSize = 10;
   private cache = new Map<string, number[]>();
@@ -55,6 +55,7 @@ export class GeminiEmbeddingService implements IEmbeddingService {
   private lastLatencyMs = 0;
   private simulated429Count = 0;
   private rateLimitCooldownUntil = 0;
+  private lastRateLimitLogged = 0;
 
   public injectSimulated429(count = 6): void {
     this.simulated429Count = count;
@@ -316,7 +317,7 @@ export class GeminiEmbeddingService implements IEmbeddingService {
     }
 
     // Process missing items with controlled high-throughput concurrency and rate-limit backoff
-    const concurrency = 12;
+    const concurrency = 6;
     for (let i = 0; i < missingTexts.length; i += concurrency) {
       const batchSlice = missingTexts.slice(i, i + concurrency);
       const indexSlice = missingIndices.slice(i, i + concurrency);
@@ -386,7 +387,11 @@ export class GeminiEmbeddingService implements IEmbeddingService {
 
         if (isRateLimitOrOverloaded) {
           hitRateLimit = true;
-          console.warn(`[Embedding] Model ${model} returned error (${errStr.slice(0, 80)}). Trying fallback candidate...`);
+          const now = Date.now();
+          if (now - this.lastRateLimitLogged > 5000) {
+            this.lastRateLimitLogged = now;
+            console.warn(`[Embedding] Model ${model} returned rate limit (${errStr.slice(0, 80)}). Trying fallback candidates...`);
+          }
           continue; // Try next candidate model immediately
         }
       }

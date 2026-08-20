@@ -20,7 +20,7 @@ import { setupRouter } from './server/routes/setup';
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+  const PORT = 3000;
 
   // JSON & URL-encoded request body parsing (supporting rich documents up to 50MB)
   app.use(express.json({ limit: '50mb' }));

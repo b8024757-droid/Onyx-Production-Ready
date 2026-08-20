@@ -41,7 +41,8 @@ export class KeywordService {
     if (!chunks || chunks.length === 0) return;
 
     for (const chunk of chunks) {
-      const tokens = this.tokenize(chunk.content);
+      const fullText = `${chunk.sectionHeader || ''} ${chunk.sectionHeader || ''} ${chunk.content} ${chunk.documentTitle || ''}`;
+      const tokens = this.tokenize(fullText);
       const length = Math.max(1, tokens.length);
 
       this.chunkLengths.set(chunk.id, length);
@@ -51,6 +52,11 @@ export class KeywordService {
       const tfMap = new Map<string, number>();
       for (const t of tokens) {
         tfMap.set(t, (tfMap.get(t) || 0) + 1);
+        // Also add singular / root forms if ends with 's' or 'ies'
+        if (t.endsWith('s') && t.length > 3) {
+          const singular = t.endsWith('ies') ? t.slice(0, -3) + 'y' : t.slice(0, -1);
+          tfMap.set(singular, (tfMap.get(singular) || 0) + 0.9);
+        }
       }
 
       for (const [term, tf] of tfMap.entries()) {

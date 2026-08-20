@@ -156,6 +156,25 @@ export class QueueService {
               }
               await dbService.saveJob(jobRec);
             }
+
+            const doc = await dbService.getDocumentById(job.data.documentId, job.data.userId);
+            if (doc && doc.status !== 'READY') {
+              doc.progress = progress;
+              doc.statusMessage = stage;
+              if (progress >= 100) {
+                doc.status = 'READY';
+              } else if (progress >= 90) {
+                doc.status = 'INDEXING';
+              } else if (progress >= 75) {
+                doc.status = 'EMBEDDING';
+              } else if (progress >= 50) {
+                doc.status = 'CHUNKING';
+              } else if (progress >= 25) {
+                doc.status = 'PARSING';
+              }
+              doc.updatedAt = new Date().toISOString();
+              await dbService.saveDocument(doc);
+            }
           });
         },
         { connection: this.workerConnection, concurrency: 3 }

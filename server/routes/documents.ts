@@ -4,18 +4,286 @@ import { dbService } from '../db/database';
 import { ingestionService } from '../services/ingestion-service';
 import { vectorService } from '../services/vector-service';
 import { keywordService } from '../services/keyword-service';
+import { storageService } from '../storage/storage-service';
 import { optionalAuth } from '../middleware/auth';
 import { DocumentType, DocumentStatus, DocumentCategory } from '../../src/types';
+import { config } from '../config';
 
 export const documentsRouter = Router();
 
 // Enable user context resolution
 documentsRouter.use(optionalAuth);
 
-const upload = multer({
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+// Multer for legacy small-file single uploads (< 50MB)
+const legacyUpload = multer({
+  limits: { fileSize: 50 * 1024 * 1024 },
   storage: multer.memoryStorage(),
 });
+
+// Multer for chunk uploads (each chunk is typically 5MB to 10MB, cap at 50MB)
+const chunkUpload = multer({
+  limits: { fileSize: 50 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+});
+
+// =========================================================================
+// CHUNKED RESUMABLE STREAMING UPLOAD ENDPOINTS (For Large Files up to 250MB+)
+// =========================================================================
+
+/**
+ * 1. POST /api/documents/upload/init
+ * Initializes a resumable upload session.
+ */
+documentsRouter.post('/upload/init', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const {
+      filename,
+      sizeBytes,
+      mimeType,
+      chunkSize,
+      clientSha256,
+      collectionId,
+      tags,
+    } = req.body || {};
+
+    if (!filename || typeof filename !== 'string') {
+      return res.status(400).json({ error: 'Valid filename is required.' });
+    }
+
+    const numericSize = parseInt(sizeBytes, 10);
+    if (isNaN(numericSize) || numericSize <= 0) {
+      return res.status(400).json({ error: 'Valid positive sizeBytes is required.' });
+    }
+
+    if (numericSize > config.upload.maxFileSizeBytes) {
+      return res.status(413).json({
+        error: `File size (${(numericSize / 1024 / 1024).toFixed(1)} MB) exceeds the maximum allowed limit of ${config.upload.maxFileSizeMb} MB.`,
+      });
+    }
+
+    const session = await storageService.initUploadSession({
+      filename: filename.trim(),
+      sizeBytes: numericSize,
+      mimeType: mimeType || 'application/octet-stream',
+      chunkSize: chunkSize ? parseInt(chunkSize, 10) : config.upload.chunkSizeBytes,
+      clientSha256: clientSha256 ? String(clientSha256).trim() : undefined,
+      collectionId,
+      tags: Array.isArray(tags) ? tags : undefined,
+      userId,
+    });
+
+    res.status(201).json({
+      uploadId: session.uploadId,
+      filename: session.filename,
+      sizeBytes: session.sizeBytes,
+      chunkSize: session.chunkSize,
+      totalChunks: session.totalChunks,
+      maxFileSizeBytes: config.upload.maxFileSizeBytes,
+      expiresAt: session.expiresAt.toISOString(),
+    });
+  } catch (err: any) {
+    console.error('[UploadInit] Error:', err.message);
+    res.status(400).json({ error: err.message || 'Failed to initialize upload session.' });
+  }
+});
+
+/**
+ * 2. POST /api/documents/upload/chunk or POST /api/documents/upload/:uploadId/chunk
+ * Accepts binary chunk slices streamed directly to disk (Zero RAM).
+ */
+const handleChunkUpload = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const uploadId = (req.params.uploadId || req.headers['x-upload-id'] || req.body?.uploadId || req.query.uploadId) as string;
+    const rawChunkIndex = req.headers['x-chunk-index'] || req.body?.chunkIndex || req.query.chunkIndex;
+    const clientChunkSha256 = (req.headers['x-chunk-sha256'] || req.body?.chunkSha256 || req.query.chunkSha256) as string | undefined;
+
+    if (!uploadId) {
+      return res.status(400).json({ error: 'Missing uploadId in request parameter or x-upload-id header.' });
+    }
+
+    if (rawChunkIndex === undefined || rawChunkIndex === null) {
+      return res.status(400).json({ error: 'Missing chunkIndex in request header (x-chunk-index) or body.' });
+    }
+
+    const chunkIndex = parseInt(String(rawChunkIndex), 10);
+    if (isNaN(chunkIndex) || chunkIndex < 0) {
+      return res.status(400).json({ error: 'Invalid chunkIndex. Must be a non-negative integer.' });
+    }
+
+    const session = storageService.getUploadSession(uploadId, userId);
+    if (!session) {
+      return res.status(404).json({ error: 'Upload session not found, expired, or access denied.' });
+    }
+
+    let chunkResult: { chunkIndex: number; size: number; sha256: string; isComplete: boolean };
+
+    // Case A: Multipart Form Data
+    if (req.file) {
+      chunkResult = await storageService.saveChunkBuffer(
+        uploadId,
+        userId,
+        chunkIndex,
+        req.file.buffer,
+        clientChunkSha256
+      );
+    }
+    // Case B: Raw Octet Stream
+    else if (req.headers['content-type']?.includes('application/octet-stream') || req.is('application/octet-stream')) {
+      chunkResult = await storageService.saveChunkStream(
+        uploadId,
+        userId,
+        chunkIndex,
+        req,
+        clientChunkSha256
+      );
+    }
+    // Case C: Buffer in Body (if parsed by body parser)
+    else if (Buffer.isBuffer(req.body)) {
+      chunkResult = await storageService.saveChunkBuffer(
+        uploadId,
+        userId,
+        chunkIndex,
+        req.body,
+        clientChunkSha256
+      );
+    }
+    // Case D: Base64 chunk string
+    else if (req.body?.chunkData) {
+      const buf = Buffer.from(req.body.chunkData, 'base64');
+      chunkResult = await storageService.saveChunkBuffer(
+        uploadId,
+        userId,
+        chunkIndex,
+        buf,
+        clientChunkSha256
+      );
+    }
+    // Fallback stream
+    else {
+      chunkResult = await storageService.saveChunkStream(
+        uploadId,
+        userId,
+        chunkIndex,
+        req,
+        clientChunkSha256
+      );
+    }
+
+    res.status(200).json({
+      uploadId,
+      chunkIndex: chunkResult.chunkIndex,
+      size: chunkResult.size,
+      sha256: chunkResult.sha256,
+      uploadedBytes: session.uploadedBytes,
+      totalChunks: session.totalChunks,
+      completedChunksCount: session.completedChunks.length,
+      isComplete: chunkResult.isComplete,
+    });
+  } catch (err: any) {
+    console.error('[ChunkUpload] Error:', err.message);
+    res.status(400).json({ error: err.message || 'Chunk upload failed.' });
+  }
+};
+
+documentsRouter.post('/upload/chunk', chunkUpload.single('chunk'), handleChunkUpload);
+documentsRouter.post('/upload/:uploadId/chunk', chunkUpload.single('chunk'), handleChunkUpload);
+
+/**
+ * 3. GET /api/documents/upload/:uploadId/status
+ * Queries active upload session status and list of received chunks for resumption.
+ */
+documentsRouter.get('/upload/:uploadId/status', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const { uploadId } = req.params;
+
+    const session = storageService.getUploadSession(uploadId, userId);
+    if (!session) {
+      return res.status(404).json({ error: 'Upload session not found, expired, or access denied.' });
+    }
+
+    const isComplete = session.completedChunks.length === session.totalChunks;
+
+    res.json({
+      uploadId: session.uploadId,
+      filename: session.filename,
+      mimeType: session.mimeType,
+      sizeBytes: session.sizeBytes,
+      chunkSize: session.chunkSize,
+      totalChunks: session.totalChunks,
+      uploadedBytes: session.uploadedBytes,
+      completedChunks: session.completedChunks,
+      isComplete,
+      expiresAt: session.expiresAt.toISOString(),
+      status: isComplete ? 'READY_TO_ASSEMBLE' : 'UPLOADING',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to get upload status.' });
+  }
+});
+
+/**
+ * 4. POST /api/documents/upload/:uploadId/complete
+ * Assembles all chunks on disk with streaming SHA-256 verification and passes file to ingestion.
+ */
+documentsRouter.post('/upload/:uploadId/complete', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const { uploadId } = req.params;
+
+    const session = storageService.getUploadSession(uploadId, userId);
+    if (!session) {
+      return res.status(404).json({ error: 'Upload session not found, expired, or access denied.' });
+    }
+
+    // Zero-RAM streaming assembly of chunks on disk
+    const { storedFile } = await storageService.assembleUpload(uploadId, userId);
+
+    // Pass assembled file into existing ONYX ingestion pipeline
+    const ingestionResult = await ingestionService.submitAssembledFileForIngestion(storedFile, {
+      userId,
+      collectionId: session.collectionId,
+      tags: session.tags,
+    });
+
+    session.finalDocumentId = ingestionResult.documentId;
+    session.finalJobId = ingestionResult.jobId;
+
+    res.status(202).json({
+      message: 'Document ingestion job accepted and queued for background processing',
+      uploadId: session.uploadId,
+      jobId: ingestionResult.jobId,
+      documentId: ingestionResult.documentId,
+      contentHash: storedFile.checksum,
+      sizeBytes: storedFile.size,
+    });
+  } catch (err: any) {
+    console.error('[UploadComplete] Error:', err.message);
+    res.status(400).json({ error: err.message || 'Failed to complete and assemble upload.' });
+  }
+});
+
+/**
+ * 5. POST /api/documents/upload/:uploadId/abort
+ * Aborts an upload session and cleans up temporary chunk files.
+ */
+documentsRouter.post('/upload/:uploadId/abort', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id || 'user-default-admin';
+    const { uploadId } = req.params;
+
+    await storageService.abortUpload(uploadId, userId);
+    res.json({ success: true, message: 'Upload session aborted and temporary files cleaned up.' });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Failed to abort upload session.' });
+  }
+});
+
+// =========================================================================
+// STANDARD / LEGACY DOCUMENT MANAGEMENT ENDPOINTS
+// =========================================================================
 
 // GET /api/documents
 documentsRouter.get('/', async (req: Request, res: Response) => {
@@ -66,10 +334,16 @@ documentsRouter.get('/:id/status', async (req: Request, res: Response) => {
     }
     res.json({
       id: doc.id,
+      title: doc.title,
+      type: doc.type,
       status: doc.status,
       progress: doc.progress,
       statusMessage: doc.statusMessage,
       chunkCount: doc.chunkCount,
+      pageCount: doc.pageCount,
+      slideCount: doc.slideCount,
+      sectionCount: doc.sectionCount,
+      sizeBytes: doc.sizeBytes,
       metrics: doc.metrics,
       updatedAt: doc.updatedAt,
     });
@@ -117,8 +391,20 @@ documentsRouter.post('/:id/retry', async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/documents/upload
-documentsRouter.post('/upload', upload.single('file'), async (req: Request, res: Response) => {
+// POST /api/documents/upload (Legacy & Small files)
+documentsRouter.post('/upload', (req: Request, res: Response, next) => {
+  legacyUpload.single('file')(req, res, (err: any) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          error: `File exceeds 50 MB limit for direct upload. For larger files (up to ${config.upload.maxFileSizeMb} MB), please use the chunked resumable upload API (/api/documents/upload/init).`,
+        });
+      }
+      return res.status(400).json({ error: err.message || 'File upload error' });
+    }
+    next();
+  });
+}, async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id || 'user-default-admin';
     const file = req.file;

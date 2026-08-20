@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { dbService } from '../db/database';
 import { DocumentParserService, NormalizedDocument, NormalizedSection } from '../parsers';
-import { storageService } from '../storage/storage-service';
+import { storageService, StoredFile } from '../storage/storage-service';
 import { embeddingService } from './embedding-service';
 import { vectorService } from './vector-service';
 import { keywordService } from './keyword-service';
@@ -127,6 +127,7 @@ export class IngestionService {
       contentHash,
       chunkCount: 0,
       sizeBytes: fileBuffer.length,
+      storagePath: storedFile.storagePath,
       tags: options.tags || [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -142,6 +143,140 @@ export class IngestionService {
       filename,
       fileType: docType,
       fileSizeBytes: fileBuffer.length,
+      storagePath: storedFile.storagePath,
+      mimeType,
+      collectionId: options.collectionId,
+      tags: options.tags,
+      chunkSize: options.chunkSize || 500,
+      chunkOverlap: options.chunkOverlap || 50,
+    });
+
+    return { jobId, documentId };
+  }
+
+  /**
+   * Main entry point for submitting an assembled large file from the resumable streaming upload pipeline
+   */
+  public async submitAssembledFileForIngestion(
+    storedFile: StoredFile,
+    options: IngestionOptions = {}
+  ): Promise<{ jobId: string; documentId: string }> {
+    const documentId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const userId = options.userId || 'user-default-admin';
+    const contentHash = storedFile.checksum;
+    const filename = storedFile.originalName;
+    const mimeType = storedFile.mimeType;
+
+    // 1. Determine collection name
+    let collectionName: string | undefined;
+    if (options.collectionId) {
+      const col = await dbService.getCollectionById(options.collectionId, userId);
+      if (col) collectionName = col.name;
+    }
+
+    const docType = this.determineDocumentType(filename, mimeType);
+
+    // Fast-path: Check for identical duplicate document already indexed for this user (Tenant Isolation Preserved)
+    const existingDuplicate = await dbService.findDocumentByHash(contentHash, userId);
+    if (existingDuplicate) {
+      const existingChunks = await dbService.getChunksForDocument(existingDuplicate.id, userId);
+      if (existingChunks.length > 0) {
+        console.log(`[IngestionService] Instant fast-path duplicate detected for user ${userId}. Reusing ${existingChunks.length} chunks from ${existingDuplicate.id}.`);
+
+        const clonedChunks: Chunk[] = existingChunks.map(c => ({
+          ...c,
+          id: `chk-${documentId}-${c.chunkIndex}`,
+          documentId,
+          documentTitle: filename,
+          userId,
+        }));
+
+        keywordService.indexBatch(clonedChunks);
+        await dbService.saveChunks(clonedChunks);
+
+        const readyDoc: Document = {
+          id: documentId,
+          userId,
+          title: filename,
+          originalName: filename,
+          type: docType,
+          category: this.determineCategory(docType),
+          status: 'READY',
+          progress: 100,
+          statusMessage: `Successfully indexed (${clonedChunks.length} chunks - Deduplicated Instant Recall)`,
+          collectionId: options.collectionId,
+          collectionName,
+          contentHash,
+          chunkCount: clonedChunks.length,
+          sizeBytes: storedFile.size,
+          tags: options.tags || [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          metrics: {
+            parsingTimeMs: 1,
+            visualExtractionTimeMs: 0,
+            chunkingTimeMs: 0,
+            embeddingTimeMs: 0,
+            qdrantTimeMs: 0,
+            bm25TimeMs: 1,
+            databaseTimeMs: 1,
+            totalTimeMs: 3,
+            embeddingCalls: 0,
+            embeddingBatchSize: 0,
+            qdrantBatchSize: 0,
+            charCount: storedFile.size,
+            deduplicated: true,
+          },
+        };
+
+        await dbService.saveDocument(readyDoc);
+
+        if (options.collectionId) {
+          const col = await dbService.getCollectionById(options.collectionId, userId);
+          if (col) {
+            col.documentCount = (col.documentCount || 0) + 1;
+            col.updatedAt = new Date().toISOString();
+            await dbService.saveCollection(col);
+          }
+        }
+
+        return { jobId, documentId };
+      }
+    }
+
+    // 2. Create initial Document record in DB
+    const initialDoc: Document = {
+      id: documentId,
+      userId,
+      title: filename,
+      originalName: filename,
+      type: docType,
+      category: this.determineCategory(docType),
+      status: 'UPLOADING',
+      progress: 10,
+      statusMessage: 'File uploaded and queued for processing',
+      collectionId: options.collectionId,
+      collectionName,
+      contentHash,
+      chunkCount: 0,
+      sizeBytes: storedFile.size,
+      storagePath: storedFile.storagePath,
+      tags: options.tags || [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await dbService.saveDocument(initialDoc);
+
+    // 3. Enqueue background processing job
+    await queueService.addIngestionJob({
+      jobId,
+      userId,
+      documentId,
+      filename,
+      fileType: docType,
+      fileSizeBytes: storedFile.size,
       storagePath: storedFile.storagePath,
       mimeType,
       collectionId: options.collectionId,
@@ -244,6 +379,7 @@ export class IngestionService {
       filename: doc.originalName || doc.title,
       fileType: doc.type,
       fileSizeBytes: doc.sizeBytes || 0,
+      storagePath: doc.storagePath,
       url: doc.sourceUrl,
       collectionId: doc.collectionId,
       tags: doc.tags,
@@ -359,6 +495,19 @@ export class IngestionService {
               charCount: parsedDoc.rawText.length,
             };
             await dbService.saveDocument(doc);
+          }
+
+          const fastJob = await dbService.getJob(data.jobId);
+          if (fastJob) {
+            fastJob.status = 'READY';
+            fastJob.progress = 100;
+            fastJob.stepMessage = `Successfully indexed (${clonedChunks.length} chunks - Deduplicated)`;
+            fastJob.completedAt = new Date().toISOString();
+            fastJob.chunkCount = clonedChunks.length;
+            fastJob.pageCount = existingDuplicate.pageCount || parsedDoc.pageCount;
+            fastJob.visualElementCount = clonedChunks.filter(c => c.metadata?.isVisual || c.id.includes('-vis-')).length;
+            fastJob.metrics = doc?.metrics;
+            await dbService.saveJob(fastJob);
           }
 
           await updateProgress(100, `Successfully indexed ${clonedChunks.length} chunks`);
@@ -535,6 +684,19 @@ export class IngestionService {
         documentId: data.documentId,
         linkTab: 'knowledge',
       });
+
+      const finalJob = await dbService.getJob(data.jobId);
+      if (finalJob) {
+        finalJob.status = 'READY';
+        finalJob.progress = 100;
+        finalJob.stepMessage = `Successfully indexed ${chunks.length} chunks`;
+        finalJob.completedAt = new Date().toISOString();
+        finalJob.chunkCount = chunks.length;
+        finalJob.pageCount = parsedDoc.pageCount;
+        finalJob.visualElementCount = chunks.filter(c => c.metadata?.isVisual || c.id.includes('-vis-')).length;
+        finalJob.metrics = metrics;
+        await dbService.saveJob(finalJob);
+      }
 
       return {
         documentId: data.documentId,

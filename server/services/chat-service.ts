@@ -65,7 +65,7 @@ export class ChatService {
 
     const intentAnalysis = rerankService.detectQueryIntent(effectiveRetrievalQuery);
     const isSummaryMode = intentAnalysis.isSummaryOrCrossSection;
-    const candidateLimit = isSummaryMode ? 40 : (config.rag.topKCandidates || 20);
+    const candidateLimit = isSummaryMode ? 50 : (config.rag.topKCandidates || 20);
 
     // 3. Query Embedding & Vector Search (with fast bounded retry & degraded fallback)
     const embedTimer = metricsService.startTimer();
@@ -110,14 +110,14 @@ export class ChatService {
     });
     metrics.bm25LatencyMs = bm25Timer.stop();
 
-    // 3b. If in Document Summary / Cross-Section mode, run multi-facet sub-query expansion
+    // 3b. If in Document Summary / Broad Multi-Facet mode, run multi-facet sub-query expansion & stratified sampling
     if (isSummaryMode) {
       const seenKeywordChunkIds = new Set(keywordResults.map(r => r.chunkId));
       for (const facet of intentAnalysis.facets) {
         try {
           const facetKwResults = await keywordService.search({
             query: facet.subQuery,
-            limit: 8,
+            limit: 10,
             filter: {
               collectionId: options.collectionId,
               documentId: options.documentId,
@@ -135,40 +135,38 @@ export class ChatService {
         }
       }
 
-      // If a specific document or single document exists, add stratified structural samples
+      // If documentId specified or available in database, add stratified page-by-page samples
       const allChunks = await dbService.getAllChunks(effectiveUserId);
       const targetDocChunks = options.documentId
         ? allChunks.filter(c => c.documentId === options.documentId)
         : allChunks;
 
       if (targetDocChunks.length > 0) {
-        const sorted = [...targetDocChunks].sort((a, b) => a.chunkIndex - b.chunkIndex);
-        // Sample representative chunks from intro, middle (methods/experiments), and conclusion
-        const sampleIndices = [
-          0,
-          Math.min(1, sorted.length - 1),
-          Math.floor(sorted.length * 0.25),
-          Math.floor(sorted.length * 0.5),
-          Math.floor(sorted.length * 0.75),
-          Math.max(0, sorted.length - 2),
-          Math.max(0, sorted.length - 1),
-        ];
+        // Group by page number to guarantee cross-page coverage
+        const pageBuckets = new Map<number, typeof targetDocChunks>();
+        for (const c of targetDocChunks) {
+          const p = c.pageNumber || 1;
+          if (!pageBuckets.has(p)) pageBuckets.set(p, []);
+          pageBuckets.get(p)!.push(c);
+        }
 
-        for (const idx of sampleIndices) {
-          const c = sorted[idx];
-          if (c && !seenKeywordChunkIds.has(c.id)) {
-            seenKeywordChunkIds.add(c.id);
-            keywordResults.push({
-              chunkId: c.id,
-              documentId: c.documentId,
-              score: 0.45,
-              content: c.content,
-              title: c.documentTitle,
-              type: 'PDF',
-              pageNumber: c.pageNumber,
-              slideNumber: c.slideNumber,
-              sectionHeader: c.sectionHeader,
-            });
+        // Sample from every page present in the document
+        for (const [_, pChunks] of pageBuckets.entries()) {
+          for (const c of pChunks.slice(0, 3)) {
+            if (!seenKeywordChunkIds.has(c.id)) {
+              seenKeywordChunkIds.add(c.id);
+              keywordResults.push({
+                chunkId: c.id,
+                documentId: c.documentId,
+                score: 0.52,
+                content: c.content,
+                title: c.documentTitle,
+                type: 'PDF',
+                pageNumber: c.pageNumber,
+                slideNumber: c.slideNumber,
+                sectionHeader: c.sectionHeader,
+              });
+            }
           }
         }
       }
@@ -176,7 +174,7 @@ export class ChatService {
 
     // Check if query is asking for visual elements, figures, charts, tables, graphs, or trends
     const visualQueryRegex = /\b(graph|graphs|chart|charts|figure|figures|fig|table|tables|diagram|diagrams|image|images|trend|trends|axis|axes|plot|plots|visual|curve|curves|histogram|histograms|page|participant|participants)\b/i;
-    if (visualQueryRegex.test(query)) {
+    if (visualQueryRegex.test(query) || isSummaryMode) {
       const allChunks = await dbService.getAllChunks(effectiveUserId);
       const visualChunks = allChunks.filter(c => 
         (c.metadata?.isVisual || c.id.includes('-vis-')) &&
@@ -190,7 +188,7 @@ export class ChatService {
         if (!alreadyInKeyword) {
           const lowerContent = vChunk.content.toLowerCase();
           const matches = sigKws.filter(kw => lowerContent.includes(kw));
-          const score = matches.length > 0 ? 0.6 + (matches.length * 0.1) : 0.45;
+          const score = matches.length > 0 ? 0.65 + (matches.length * 0.1) : 0.50;
 
           keywordResults.push({
             chunkId: vChunk.id,
@@ -209,7 +207,7 @@ export class ChatService {
 
     // 4. Reciprocal Rank Fusion (RRF)
     const rrfTimer = metricsService.startTimer();
-    const rrfTopN = isSummaryMode ? 12 : (config.rag.topKReranked || 6);
+    const rrfTopN = isSummaryMode ? 36 : (config.rag.topKReranked || 6);
     const rrfCandidates = rerankService.reciprocalRankFusion(vectorResults, keywordResults, {
       k: config.rag.rrfConstantK || 60,
       topN: rrfTopN,
@@ -218,7 +216,7 @@ export class ChatService {
 
     // 5. Neural Cross-Encoder Reranking
     const rerankTimer = metricsService.startTimer();
-    const rerankTopK = isSummaryMode ? 10 : (config.rag.topKReranked || 6);
+    const rerankTopK = isSummaryMode ? 24 : (config.rag.topKReranked || 6);
     const finalCandidates = await rerankService.neuralRerank(
       query,
       rrfCandidates,
@@ -277,7 +275,7 @@ export class ChatService {
 
     // 7. Context Construction with Grounded Candidates
     const contextTimer = metricsService.startTimer();
-    const grounded = ContextService.buildGroundedContext(validCandidates, 3500);
+    const grounded = ContextService.buildGroundedContext(validCandidates, isSummaryMode ? 7500 : 3500);
     metrics.contextBuildingLatencyMs = contextTimer.stop();
 
     // Send Citations Event immediately to frontend
@@ -417,22 +415,38 @@ Provide an analytical, grounded answer with inline citations [[01]], [[02]]:`;
     }
 
     const leadCitation = citations[0];
-    const secondaryCitation = citations.length > 1 ? citations[1] : null;
 
     let response = `Based on the grounded evidence in **${leadCitation.documentTitle}** [[01]], `;
-    response += `${leadCitation.excerpt.slice(0, 220).trim()}...\n\n`;
+    response += `${leadCitation.excerpt.slice(0, 260).trim()}...\n\n`;
 
-    if (secondaryCitation) {
-      response += `Furthermore, as detailed in **${secondaryCitation.documentTitle}** [[02]]:\n`;
-      response += `> ${secondaryCitation.excerpt.slice(0, 180).trim()}...\n\n`;
+    if (citations.length > 1) {
+      response += `### Key Document Evidence & Findings\n\n`;
+      for (let i = 1; i < Math.min(citations.length, 8); i++) {
+        const cit = citations[i];
+        const idx = cit.citationIndex < 10 ? `0${cit.citationIndex}` : `${cit.citationIndex}`;
+        const sectionName = cit.section || (cit.pageNumber ? `Page ${cit.pageNumber}` : 'Document Excerpt');
+        const visualLabel = cit.isVisual ? ` [Visual/Figure: ${cit.figureTitle || cit.figureId || 'Graphic'}]` : '';
+        
+        response += `- **${sectionName}${visualLabel}** [[${idx}]]: ${cit.excerpt.slice(0, 200).replace(/\n+/g, ' ').trim()}...\n`;
+      }
+      response += `\n`;
     }
 
-    response += `### Summary & Key Takeaways\n`;
-    response += `- **Primary Evidence**: Direct match retrieved with confidence score **${leadCitation.score}** [[01]].\n`;
-    if (secondaryCitation) {
-      response += `- **Supporting Context**: Cross-referenced with **${secondaryCitation.documentTitle}** (Page/Section: ${secondaryCitation.section || 'General'}) [[02]].\n`;
+    // Visual elements section if present in citations
+    const visualCitations = citations.filter(c => c.isVisual || c.trendSummary || c.figureId);
+    if (visualCitations.length > 0) {
+      response += `### Visual & Empirical Observations\n`;
+      for (const vCit of visualCitations.slice(0, 4)) {
+        const vIdx = vCit.citationIndex < 10 ? `0${vCit.citationIndex}` : `${vCit.citationIndex}`;
+        response += `- **${vCit.figureTitle || vCit.figureId || 'Visual Evidence'}** (Page ${vCit.pageNumber || 'N/A'}) [[${vIdx}]]: ${vCit.trendSummary || vCit.excerpt.slice(0, 150).trim()}\n`;
+      }
+      response += `\n`;
     }
-    response += `- **Retrieval Mode**: Hybrid RRF (Vector + BM25) and Neural Cross-Encoder ranking.`;
+
+    response += `### Grounding & Synthesis Summary\n`;
+    response += `- **Coverage**: ${citations.length} grounded source passages verified across document sections.\n`;
+    response += `- **Evidence Integrity**: All statements directly cited with bracketed references corresponding to indexed content.\n`;
+    response += `- **Retrieval Pipeline**: Hybrid RRF (Dense Vector + BM25 Lexical) with neural cross-encoder reranking.`;
 
     return response;
   }

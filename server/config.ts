@@ -32,5 +32,16 @@ export const config = {
     topKCandidates: 20,
     topKReranked: 6,
     rrfConstantK: 60,
-  }
+  },
+  upload: {
+    maxFileSizeMb: parseInt(process.env.MAX_FILE_SIZE_MB || '250', 10),
+    chunkSizeMb: parseInt(process.env.UPLOAD_CHUNK_SIZE_MB || '5', 10),
+    sessionTtlMinutes: parseInt(process.env.UPLOAD_SESSION_TTL_MINUTES || '60', 10),
+    get maxFileSizeBytes(): number {
+      return this.maxFileSizeMb * 1024 * 1024;
+    },
+    get chunkSizeBytes(): number {
+      return this.chunkSizeMb * 1024 * 1024;
+    },
+  },
 };

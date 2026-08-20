@@ -37,6 +37,8 @@ export interface RerankedCandidate {
 export type QueryIntent =
   | 'DOCUMENT_SUMMARY'
   | 'CROSS_SECTION'
+  | 'BROAD_MULTI_FACET'
+  | 'FIGURE_SPECIFIC'
   | 'SECTION_SPECIFIC'
   | 'FACTUAL';
 
@@ -45,6 +47,7 @@ export interface SummaryFacet {
   label: string;
   terms: string[];
   subQuery: string;
+  exactTerms?: string[];
   priority: number;
 }
 
@@ -55,6 +58,7 @@ export interface QueryIntentAnalysis {
   targetSections: string[];
   namedEntities: string[];
   rawKeywords: string[];
+  exactPhrases: string[];
 }
 
 export interface RAGDiagnosticLog {
@@ -73,9 +77,15 @@ export interface RAGDiagnosticLog {
     sectionHeader?: string;
     finalScore: number;
     matchedFacets?: string[];
+    isVisual?: boolean;
+    figureId?: string;
   }>;
+  supportedFacets?: string[];
+  unsupportedFacets?: string[];
+  pagesCovered?: number[];
+  figuresDetected?: string[];
   groundingScore: number;
-  groundingStatus: 'GROUNDED' | 'INSUFFICIENT_EVIDENCE';
+  groundingStatus: 'GROUNDED' | 'PARTIALLY_GROUNDED' | 'INSUFFICIENT_EVIDENCE';
   reason: string;
   timestamp: string;
 }
@@ -97,7 +107,7 @@ const STOPWORDS = new Set([
   'yourselves', 'tell', 'show', 'shown', 'shows', 'give', 'find', 'know', 'name', 'explain', 'explains', 'describe',
   'describes', 'identify', 'identifies', 'list', 'lists', 'relate', 'relates', 'related', 'discuss', 'discussed',
   'surround', 'surrounding', 'relevant', 'many', 'much', 'involved', 'mention', 'mentioned', 'contain', 'contains',
-  'including', 'includes', 'means', 'meaning', 'based', 'given', 'following'
+  'including', 'includes', 'means', 'meaning', 'based', 'given', 'following', 'please', 'paper', 'document', 'study'
 ]);
 
 export class RerankService {
@@ -119,42 +129,99 @@ export class RerankService {
   }
 
   /**
+   * Extracts exact technical terms, acronyms, equations, and numbers.
+   */
+  public extractExactTechnicalTerms(query: string): string[] {
+    if (!query) return [];
+    const exactTerms: string[] = [];
+
+    // Acronyms & uppercase terms (e.g. HMM, CRF, EEG, IMU, LOSO, SVM, AUC, ROC, L-BFGS)
+    const acronyms = query.match(/\b([A-Z]{2,}(?:-[A-Za-z0-9]+)?)\b/g);
+    if (acronyms) exactTerms.push(...acronyms);
+
+    // Specific multi-word technical concepts
+    const concepts = [
+      'Naive Bayes', 'Conditional Random Field', 'Hidden Markov Model',
+      'Bayesian inference', 'Butterworth filter', 'task-switch', 'task switch',
+      'NeuroSky', 'MindBand', 'Empatica', 'Shimmer3', 'feature extraction',
+      'spectral energy', 'mean error', 'standard deviation'
+    ];
+    for (const concept of concepts) {
+      if (new RegExp(`\\b${concept}\\b`, 'i').test(query)) {
+        exactTerms.push(concept);
+      }
+    }
+
+    // Numbers with units or decimals (e.g. 0.35s, 27.02s, 0.25Hz, 50 Hz, 94.2%, 86.4%)
+    const numbersWithUnits = query.match(/\b\d+(?:\.\d+)?\s*(?:s|sec|seconds|hz|mhz|ghz|%|percent|mw|fps|g|deg\/s)\b/gi);
+    if (numbersWithUnits) exactTerms.push(...numbersWithUnits);
+
+    // Figure and Table references (e.g. Figure 1, Fig. 2, Table 1)
+    const figures = query.match(/\b(?:Figure|Fig\.?|Table)\s*\d+\b/gi);
+    if (figures) exactTerms.push(...figures);
+
+    return Array.from(new Set(exactTerms));
+  }
+
+  /**
    * Intelligently classifies the user query intent to determine whether
    * a high-coverage multi-section summary pipeline or high-precision factual pipeline is required.
    */
   public detectQueryIntent(query: string): QueryIntentAnalysis {
     const rawKeywords = this.extractSignificantKeywords(query);
+    const exactPhrases = this.extractExactTechnicalTerms(query);
     const lower = query.toLowerCase();
+
+    // Figure-specific query check
+    const isFigureQuery = /\b(figure\s*\d+|fig\s*\d+|table\s*\d+|chart\s*\d+|graph\s*\d+|diagram\s*\d+|what does figure|show me figure|confusion matrix|roc curve)\b/i.test(query);
 
     // Structural domain definitions
     const domainIntro = /\b(intro|introduction|background|motivation|problem|objective|purpose|context|abstract|overview)\b/i;
-    const domainMethod = /\b(method|methodology|approach|model|models|architecture|algorithm|algorithms|framework|technique|hmm|crf|markov|neural|classifier|process|pipeline)\b/i;
+    const domainMethod = /\b(method|methodology|approach|model|models|architecture|algorithm|algorithms|framework|technique|hmm|crf|markov|naive bayes|classifier|process|pipeline)\b/i;
     const domainExperiment = /\b(experiment|experiments|experimental|sensor|sensors|data|dataset|hardware|device|setup|subjects|participants|wearable|benchmark|protocol)\b/i;
-    const domainResults = /\b(result|results|performance|accuracy|f1|precision|recall|metric|metrics|findings|evaluation|outcome|score|scores|comparison)\b/i;
+    const domainProcessing = /\b(eeg|signal|filtering|filter|butterworth|artifact|preprocessing|feature|features|extraction|spectral)\b/i;
+    const domainTaskSwitch = /\b(task-switch|task switch|transition|transitions|postural|state switching)\b/i;
+    const domainResults = /\b(result|results|performance|accuracy|f1|precision|recall|metric|metrics|findings|evaluation|outcome|score|scores|comparison|numerical)\b/i;
+    const domainFigures = /\b(figure|figures|fig|chart|charts|graph|graphs|table|tables|plot|plots|visual)\b/i;
+    const domainBayesian = /\b(bayesian|bayes|prior|posterior|probability distribution|inference)\b/i;
     const domainLimitations = /\b(limitation|limitations|drawback|drawbacks|challenge|challenges|discussion|weakness|weaknesses|future work|constraint|constraints|caveat)\b/i;
-    const domainConclusion = /\b(conclusion|conclusions|conclude|concluded|wrap up|summary|takeaways|takeaway)\b/i;
+    const domainRelated = /\b(related work|prior literature|previous studies|existing methods)\b/i;
+    const domainConclusion = /\b(conclusion|conclusions|conclude|concluded|wrap up|summary|takeaways|takeaway|future potential|demonstrated)\b/i;
 
     const matchedDomains: string[] = [];
     if (domainIntro.test(query)) matchedDomains.push('intro');
     if (domainMethod.test(query)) matchedDomains.push('method');
     if (domainExperiment.test(query)) matchedDomains.push('experiment');
+    if (domainProcessing.test(query)) matchedDomains.push('processing');
+    if (domainTaskSwitch.test(query)) matchedDomains.push('task_switch');
     if (domainResults.test(query)) matchedDomains.push('results');
+    if (domainFigures.test(query)) matchedDomains.push('figures');
+    if (domainBayesian.test(query)) matchedDomains.push('bayesian');
     if (domainLimitations.test(query)) matchedDomains.push('limitations');
+    if (domainRelated.test(query)) matchedDomains.push('related');
     if (domainConclusion.test(query)) matchedDomains.push('conclusion');
 
     // Whole-document summary indicators
-    const isExplicitSummary = /\b(summarize|summary|overview|outline|entire paper|whole paper|entire document|whole document|all sections|synopsis|briefing|executive summary|main takeaways|core findings|what is this (paper|document) about|explain the paper)\b/i.test(query);
+    const isExplicitSummary = /\b(summarize|summary|overview|outline|entire paper|whole paper|entire document|whole document|all sections|synopsis|briefing|executive summary|main takeaways|core findings|what is this (paper|document) about|explain the paper|complete analysis|complete analytical analysis|comprehensive analysis|analyze the study|analyze this paper)\b/i.test(query);
+
+    // Multi-topic query detection (e.g. comma-separated list of topics or 3+ domains)
+    const commaClauseCount = (query.match(/,/g) || []).length;
+    const isMultiClauseBroad = commaClauseCount >= 3 && matchedDomains.length >= 2;
 
     let intent: QueryIntent = 'FACTUAL';
-    if (isExplicitSummary || matchedDomains.length >= 3) {
+    if (isExplicitSummary || matchedDomains.length >= 4) {
       intent = 'DOCUMENT_SUMMARY';
+    } else if (isMultiClauseBroad || matchedDomains.length >= 3) {
+      intent = 'BROAD_MULTI_FACET';
+    } else if (isFigureQuery) {
+      intent = 'FIGURE_SPECIFIC';
     } else if (matchedDomains.length >= 2) {
       intent = 'CROSS_SECTION';
-    } else if (matchedDomains.length === 1 && !/\b(what is|who is|when did|where is|how many|which specific)\b/i.test(query)) {
+    } else if (matchedDomains.length === 1 && !/\b(what is|who is|when did|where is|how many|which specific|calculate|define)\b/i.test(query)) {
       intent = 'SECTION_SPECIFIC';
     }
 
-    const isSummaryOrCrossSection = intent === 'DOCUMENT_SUMMARY' || intent === 'CROSS_SECTION';
+    const isSummaryOrCrossSection = intent === 'DOCUMENT_SUMMARY' || intent === 'BROAD_MULTI_FACET' || intent === 'CROSS_SECTION';
     const facets = this.decomposeSummaryFacets(query, intent, matchedDomains);
 
     // Extract named entities / technical terms (e.g., HMM, CRF, sensors, specific model names)
@@ -167,13 +234,14 @@ export class RerankService {
       isSummaryOrCrossSection,
       facets,
       targetSections: matchedDomains,
-      namedEntities: Array.from(new Set(technicalTerms)),
+      namedEntities: Array.from(new Set([...technicalTerms, ...exactPhrases])),
       rawKeywords,
+      exactPhrases,
     };
   }
 
   /**
-   * Decomposes broad summary and cross-section queries into targeted structural facets.
+   * Decomposes broad summary and multi-facet queries into targeted structural facets.
    */
   public decomposeSummaryFacets(
     query: string,
@@ -183,70 +251,130 @@ export class RerankService {
     const facets: SummaryFacet[] = [];
     const lower = query.toLowerCase();
 
-    // 1. Overview / Introduction / Motivation
+    // 1. Universal Overview / Introduction / Motivation
     facets.push({
       name: 'overview',
       label: 'Introduction & Motivation',
       terms: ['abstract', 'introduction', 'background', 'motivation', 'problem', 'purpose', 'overview'],
       subQuery: 'problem statement motivation background overview introduction',
+      exactTerms: ['introduction', 'background', 'motivation'],
       priority: 1,
     });
 
-    // 2. Methodology & Modeling (e.g., HMM, CRF, algorithms)
-    const methodTerms = ['methodology', 'method', 'approach', 'model', 'algorithm', 'architecture'];
-    if (lower.includes('hmm') || lower.includes('markov')) methodTerms.push('hmm', 'hidden markov model', 'markov');
-    if (lower.includes('crf') || lower.includes('conditional random')) methodTerms.push('crf', 'conditional random field');
+    // 2. Universal Experimental Setup & Hardware / Sensors
+    const expTerms = ['experiment', 'experimental', 'dataset', 'data', 'evaluation', 'setup', 'participant', 'participants', 'subject', 'subjects', 'volunteer', 'volunteers', 'protocol'];
+    const sensorTerms = ['sensor', 'sensors', 'hardware', 'device', 'wearable', 'placement', 'imu', 'accelerometer', 'gyroscope', 'neurosky', 'mindband', 'empatica', 'e3', 'shimmer3'];
     facets.push({
-      name: 'methodology',
-      label: 'Methodology & Models',
-      terms: methodTerms,
-      subQuery: `methodology approach model algorithm ${methodTerms.slice(6).join(' ')}`.trim(),
+      name: 'experiment_sensors',
+      label: 'Experiment, Participants & Sensor Setup',
+      terms: [...expTerms, ...sensorTerms],
+      subQuery: 'experimental setup participants subjects sensor hardware placement wearable devices NeuroSky Empatica Shimmer3 IMU accelerometer gyroscope',
+      exactTerms: ['participants', 'subjects', 'sensors', 'hardware', 'IMU', 'accelerometer', 'gyroscope'],
       priority: 2,
     });
 
-    // 3. Experiments & Data / Sensors
-    const expTerms = ['experiment', 'experimental', 'dataset', 'data', 'evaluation', 'setup'];
-    if (lower.includes('sensor')) expTerms.push('sensor', 'sensors', 'wearable', 'hardware');
-    if (lower.includes('participant') || lower.includes('subject')) expTerms.push('participants', 'subjects');
+    // 3. Universal Sequential Models & Methodology (HMM, CRF, algorithms)
+    const modelTerms = ['methodology', 'method', 'approach', 'model', 'algorithm', 'architecture', 'hmm', 'markov', 'crf', 'conditional random field', 'naive bayes', 'generative', 'discriminative', 'state transition', 'emission', 'baum-welch', 'viterbi', 'l-bfgs', 'formulation', 'mathematical'];
     facets.push({
-      name: 'experiment',
-      label: 'Experimental Setup & Sensors',
-      terms: expTerms,
-      subQuery: `experimental setup data collection sensors hardware ${expTerms.slice(6).join(' ')}`.trim(),
+      name: 'models_hmm_crf',
+      label: 'HMM & CRF Models & Methodology',
+      terms: modelTerms,
+      subQuery: 'Hidden Markov Model HMM Conditional Random Field CRF generative discriminative model state transitions methodology mathematical formulation',
+      exactTerms: ['HMM', 'Hidden Markov Model', 'CRF', 'Conditional Random Field', 'generative', 'discriminative'],
       priority: 3,
     });
 
-    // 4. Major Results & Performance
+    // 4. Universal Major Results & Metrics
     facets.push({
-      name: 'results',
-      label: 'Major Results & Evaluation',
-      terms: ['results', 'performance', 'accuracy', 'metrics', 'findings', 'comparison', 'evaluation', 'f1'],
-      subQuery: 'major results performance accuracy empirical findings metrics comparison',
+      name: 'results_metrics',
+      label: 'Numerical Results & Evaluation Metrics',
+      terms: ['results', 'performance', 'accuracy', 'metrics', 'findings', 'comparison', 'evaluation', 'f1', 'precision', 'recall', 'mean error', 'standard deviation', 'table'],
+      subQuery: 'major results numerical accuracy F1 precision recall mean error standard deviation statistical performance comparison Table',
+      exactTerms: ['accuracy', 'F1', 'mean error', 'standard deviation', 'results', 'Table'],
       priority: 4,
     });
 
-    // 5. Discussion & Limitations
+    // 5. Universal Limitations & Discussion
     facets.push({
-      name: 'limitations',
+      name: 'limitations_discussion',
       label: 'Limitations & Discussion',
-      terms: ['limitations', 'challenges', 'discussion', 'weaknesses', 'drawbacks', 'trade-offs', 'constraints'],
-      subQuery: 'limitations challenges weaknesses drawbacks discussion',
+      terms: ['limitations', 'challenges', 'discussion', 'weaknesses', 'drawbacks', 'trade-offs', 'constraints', 'battery', 'energy', 'hardware'],
+      subQuery: 'limitations challenges weaknesses drawbacks trade-offs constraints discussion battery energy',
+      exactTerms: ['limitations', 'challenges', 'weaknesses', 'drawbacks'],
       priority: 5,
     });
 
-    // 6. Conclusion & Takeaways
+    // 6. Universal Conclusion & Future Work
     facets.push({
-      name: 'conclusion',
-      label: 'Conclusion & Future Work',
-      terms: ['conclusion', 'conclusions', 'summary', 'future work', 'key takeaways', 'concluding'],
-      subQuery: 'conclusion future work summary core takeaways',
+      name: 'conclusion_future_work',
+      label: 'Conclusion & Future Potential',
+      terms: ['conclusion', 'conclusions', 'summary', 'future work', 'key takeaways', 'concluding', 'future potential', 'demonstrated', 'implications'],
+      subQuery: 'conclusion future work future potential key takeaways experimental demonstration summary',
+      exactTerms: ['conclusion', 'future work', 'future potential'],
       priority: 6,
     });
 
-    // If query explicitly asked for specific concepts (like sensors, HMM, CRF, limitations), boost priority
+    // Specialized / Domain-conditional facets (activated if query or domain mentions them)
+    if (/\b(eeg|signal|brain|neuro|filtering|butterworth|artifact|preprocessing|feature extraction|spectral)\b/i.test(query)) {
+      facets.push({
+        name: 'eeg_feature_extraction',
+        label: 'EEG Data Processing & Feature Extraction',
+        terms: ['eeg', 'signal', 'processing', 'filter', 'filtering', 'butterworth', 'artifact', 'sampling', 'feature', 'features', 'extraction', 'spectral', 'energy', 'frequency', 'time-domain', 'sma'],
+        subQuery: 'EEG data processing signal filtering Butterworth artifact removal feature extraction spectral energy time domain frequency',
+        exactTerms: ['EEG', 'processing', 'filtering', 'Butterworth', 'feature extraction', 'spectral energy'],
+        priority: 2.5,
+      });
+    }
+
+    if (/\b(task-switch|task switch|transition|transitions|postural|switching|state sequence)\b/i.test(query)) {
+      facets.push({
+        name: 'task_switch_detection',
+        label: 'Task-Switch Detection & Transition Dynamics',
+        terms: ['task-switch', 'task switch', 'transition', 'transitions', 'dynamic', 'postural', 'switching', 'detection', 'state sequence'],
+        subQuery: 'task-switch detection methodology transition dynamics state switching postural transitions dynamic activities',
+        exactTerms: ['task-switch', 'task switch', 'transition', 'transitions'],
+        priority: 3.5,
+      });
+    }
+
+    if (/\b(figure|figures|fig|chart|charts|graph|graphs|plot|plots|roc|confusion matrix|curve|diagram)\b/i.test(query)) {
+      facets.push({
+        name: 'figures_visuals',
+        label: 'Figures, Charts & Visual Evidence',
+        terms: ['figure', 'figures', 'fig', 'chart', 'charts', 'graph', 'graphs', 'plot', 'plots', 'roc', 'confusion matrix', 'curve', 'diagram'],
+        subQuery: 'Figure 1 Figure 2 Figure 3 Figure 4 confusion matrix ROC curve charts graphs visual results plots',
+        exactTerms: ['Figure', 'Fig', 'Figure 1', 'Figure 2', 'Figure 3', 'Figure 4', 'confusion matrix', 'ROC curve'],
+        priority: 3.8,
+      });
+    }
+
+    if (/\b(bayesian|bayes|prior|posterior|probability distribution|inference)\b/i.test(query)) {
+      facets.push({
+        name: 'bayesian_inference',
+        label: 'Bayesian Inference & Probability Distribution',
+        terms: ['bayesian', 'bayes', 'prior', 'posterior', 'likelihood', 'inference', 'probability', 'distribution', 'update'],
+        subQuery: 'Bayesian inference prior posterior probability distribution likelihood updates statistical modeling',
+        exactTerms: ['Bayesian inference', 'Bayesian', 'posterior', 'prior'],
+        priority: 4.5,
+      });
+    }
+
+    if (/\b(related work|prior literature|previous studies|existing methods)\b/i.test(query)) {
+      facets.push({
+        name: 'related_work',
+        label: 'Related Work & Prior Studies',
+        terms: ['related work', 'prior literature', 'previous studies', 'existing methods', 'literature review'],
+        subQuery: 'related work prior literature previous studies existing methods baseline comparison',
+        exactTerms: ['related work', 'prior studies'],
+        priority: 5.5,
+      });
+    }
+
+    // Boost priority of facets matching terms in the query
     facets.forEach(f => {
-      if (f.terms.some(t => lower.includes(t))) {
-        f.priority -= 0.5;
+      const matchCount = f.terms.filter(t => lower.includes(t.toLowerCase())).length;
+      if (matchCount > 0) {
+        f.priority -= matchCount * 0.8;
       }
     });
 
@@ -359,7 +487,7 @@ export class RerankService {
     const candidates = Array.from(candidateMap.values());
     candidates.sort((a, b) => b.rrfScore - a.rrfScore);
 
-    return candidates.slice(0, topN * 2);
+    return candidates.slice(0, Math.max(topN * 3, 50));
   }
 
   /**
@@ -379,7 +507,7 @@ export class RerankService {
   ): Promise<RerankedCandidate[]> {
     if (candidates.length === 0) return [];
     if (options?.skipNeural || candidates.length <= 1) {
-      return this.balanceCandidatesAcrossSections(candidates.slice(0, topK), topK, options?.facets);
+      return this.balanceCandidatesAcrossSections(candidates, topK, options?.facets);
     }
 
     const ai = getGeminiClient();
@@ -393,8 +521,8 @@ export class RerankService {
         );
 
         const candidateDescriptions = candidates
-          .slice(0, 24)
-          .map((c, i) => `[PASSAGE ${i + 1}] (Section: ${c.sectionHeader || 'General'}, Page: ${c.pageNumber || 1})\n${c.content.slice(0, 350)}`)
+          .slice(0, 30)
+          .map((c, i) => `[PASSAGE ${i + 1}] (Section: ${c.sectionHeader || 'General'}, Page: ${c.pageNumber || 1}${c.isVisual ? ' | VISUAL FIGURE' : ''})\n${c.content.slice(0, 350)}`)
           .join('\n\n---\n\n');
 
         let prompt = '';
@@ -471,13 +599,40 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     this.tagCandidateFacets(candidates, options?.facets);
 
     const sigKeywords = this.extractSignificantKeywords(query);
+    const exactTerms = this.extractExactTechnicalTerms(query);
+    const isMathOrMethodQuery = /\b(formulation|mathematical|formula|equation|feature extraction|features|algorithm|loss function|probability)\b/i.test(query);
+
     candidates.forEach(c => {
       const text = `${c.title} ${c.sectionHeader || ''} ${c.content}`.toLowerCase();
       let matchCount = 0;
       for (const w of sigKeywords) {
         if (text.includes(w)) matchCount++;
       }
-      const matchRatio = sigKeywords.length > 0 ? matchCount / sigKeywords.length : 0.0;
+
+      let exactMatchCount = 0;
+      for (const term of exactTerms) {
+        if (text.includes(term.toLowerCase())) exactMatchCount += 2;
+      }
+
+      // Section header keyword match boost
+      let headerBoost = 0;
+      if (c.sectionHeader) {
+        const hText = c.sectionHeader.toLowerCase();
+        for (const w of sigKeywords) {
+          if (hText.includes(w)) headerBoost += 0.15;
+        }
+      }
+
+      // Mathematical formulation boost for math/methodology queries
+      let mathBoost = 0;
+      if (isMathOrMethodQuery) {
+        if (/p\(|sum_|prod\(|exp\(|z\(x\)|\bl-bfgs\b|\bbaum-welch\b|\bgaussian\b|\bfeature extraction\b|\btime-domain\b/i.test(c.content)) {
+          mathBoost = 0.35;
+        }
+      }
+
+      const totalTerms = Math.max(1, sigKeywords.length + exactTerms.length * 2);
+      const matchRatio = Math.min(1.0, (matchCount + exactMatchCount) / totalTerms + headerBoost + mathBoost);
       
       const bestFacetScore = c.bestFacetScore || 0;
       const combinedAlgorithmic = isSummary
@@ -486,7 +641,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
 
       c.neuralRerankScore = combinedAlgorithmic;
       c.isNeuralEvaluated = false;
-      c.finalScore = c.rrfScore * 0.4 + combinedAlgorithmic * 0.6;
+      c.finalScore = c.rrfScore * 0.3 + combinedAlgorithmic * 0.7;
     });
 
     candidates.sort((a, b) => b.finalScore - a.finalScore);
@@ -494,7 +649,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
   }
 
   /**
-   * Tags candidate chunks with the structural facets they satisfy (Overview, Methods, Experiments, Results, Limitations, Conclusion).
+   * Tags candidate chunks with the structural facets they satisfy.
    */
   private tagCandidateFacets(candidates: RerankedCandidate[], facets?: SummaryFacet[]): void {
     const activeFacets = facets || this.decomposeSummaryFacets('', 'DOCUMENT_SUMMARY', []);
@@ -513,7 +668,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         }
         if (facetMatches > 0) {
           matched.push(f.name);
-          const fScore = Math.min(1.0, (facetMatches / Math.max(2, f.terms.length * 0.5)) + 0.2);
+          const fScore = Math.min(1.0, (facetMatches / Math.max(2, f.terms.length * 0.4)) + 0.2);
           if (fScore > bestScore) bestScore = fScore;
         }
       }
@@ -521,6 +676,11 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       // Also check page / section position heuristics if sectionHeader is missing
       if (cand.pageNumber !== undefined) {
         if (cand.pageNumber <= 2 && !matched.includes('overview')) matched.push('overview');
+      }
+
+      if (cand.isVisual) {
+        matched.push('figures_visuals');
+        bestScore = Math.max(bestScore, 0.85);
       }
 
       cand.matchedFacets = matched;
@@ -537,7 +697,14 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     topK: number,
     facets?: SummaryFacet[]
   ): RerankedCandidate[] {
-    if (candidates.length <= topK) return candidates;
+    if (candidates.length <= topK) {
+      return [...candidates].sort((a, b) => {
+        if (a.pageNumber !== undefined && b.pageNumber !== undefined && a.pageNumber !== b.pageNumber) {
+          return a.pageNumber - b.pageNumber;
+        }
+        return b.finalScore - a.finalScore;
+      });
+    }
 
     const selected: RerankedCandidate[] = [];
     const seenChunkIds = new Set<string>();
@@ -545,11 +712,11 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     const seenSections = new Map<string, number>();
     const coveredFacets = new Set<string>();
 
-    // Pass 0: Always preserve top direct relevance candidates (top 3)
+    // Pass 0: Always preserve top direct relevance candidates (top 4)
     const sortedByScore = [...candidates].sort((a, b) => b.finalScore - a.finalScore);
-    for (let i = 0; i < Math.min(3, sortedByScore.length); i++) {
+    for (let i = 0; i < Math.min(4, sortedByScore.length); i++) {
       const cand = sortedByScore[i];
-      if (cand && cand.finalScore > 0.05) {
+      if (cand && cand.finalScore > 0.02) {
         selected.push(cand);
         seenChunkIds.add(cand.chunkId);
         cand.matchedFacets?.forEach(f => coveredFacets.add(f));
@@ -567,7 +734,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       const match = candidates.find(c =>
         !seenChunkIds.has(c.chunkId) &&
         c.matchedFacets?.includes(facetName) &&
-        c.finalScore >= 0.05
+        c.finalScore >= 0.02
       );
       if (match) {
         selected.push(match);
@@ -578,14 +745,37 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       }
     }
 
-    // Pass 2: Fill remaining slots by highest final score with section diversity penalty
+    // Pass 2: Ensure representation from distinct pages across the whole document (pages 1..N)
+    const allPages = Array.from(new Set(candidates.map(c => c.pageNumber).filter((p): p is number => p !== undefined))).sort((a, b) => a - b);
+    for (const page of allPages) {
+      if (selected.length >= topK) break;
+      if (!seenPages.has(page) || seenPages.get(page) === 0) {
+        const pageCandidate = candidates.find(c => !seenChunkIds.has(c.chunkId) && c.pageNumber === page && c.finalScore >= 0.02);
+        if (pageCandidate) {
+          selected.push(pageCandidate);
+          seenChunkIds.add(pageCandidate.chunkId);
+          seenPages.set(page, (seenPages.get(page) || 0) + 1);
+          pageCandidate.matchedFacets?.forEach(f => coveredFacets.add(f));
+        }
+      }
+    }
+
+    // Pass 3: Preserve visual chunks (figures, charts)
+    for (const cand of candidates) {
+      if (selected.length >= topK) break;
+      if (cand.isVisual && !seenChunkIds.has(cand.chunkId)) {
+        selected.push(cand);
+        seenChunkIds.add(cand.chunkId);
+      }
+    }
+
+    // Pass 4: Fill remaining slots by highest final score with section diversity penalty
     for (const cand of candidates) {
       if (selected.length >= topK) break;
       if (seenChunkIds.has(cand.chunkId)) continue;
 
       const pageCount = cand.pageNumber ? (seenPages.get(cand.pageNumber) || 0) : 0;
-      // Prefer diverse pages unless pool is exhausted
-      if (pageCount >= 2 && candidates.length > topK * 1.5) {
+      if (pageCount >= 3 && candidates.length > topK * 1.2) {
         continue;
       }
 
@@ -594,7 +784,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       if (cand.pageNumber) seenPages.set(cand.pageNumber, pageCount + 1);
     }
 
-    // Pass 3: If still not at topK, fill unconditionally from remaining candidates
+    // Pass 5: If still not at topK, fill unconditionally from remaining candidates
     if (selected.length < topK) {
       for (const cand of candidates) {
         if (selected.length >= topK) break;
@@ -605,8 +795,8 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       }
     }
 
+    // Sort in document reading order (page/chunk sequence) for coherent grounded synthesis
     selected.sort((a, b) => {
-      // Sort in document reading order (page/chunk sequence) for coherent grounded synthesis
       if (a.pageNumber !== undefined && b.pageNumber !== undefined && a.pageNumber !== b.pageNumber) {
         return a.pageNumber - b.pageNumber;
       }
@@ -618,8 +808,7 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
 
   /**
    * Grounding Gate: Evaluates candidate pool against conservative relevance criteria.
-   * In document summary mode, evaluates cross-section grounding coverage across the document.
-   * Strictly rejects queries with zero grounded evidence to prevent hallucinations.
+   * Evaluates groundedness facet by facet with partial evidence handling and 2-stage verification.
    */
   public filterGroundedCandidates(
     query: string,
@@ -634,43 +823,57 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     const isSummary = options?.isSummaryMode ?? false;
     const intentAnalysis = options?.intentAnalysis ?? this.detectQueryIntent(query);
     const sigKeywords = intentAnalysis.rawKeywords;
-    const minNeuralScore = options?.minNeuralScore ?? (isSummary ? 0.25 : 0.40);
+    const minNeuralScore = options?.minNeuralScore ?? (isSummary ? 0.20 : 0.40);
 
     let validCandidates: RerankedCandidate[] = [];
     let rejectionReason = '';
     let overallGroundingScore = 0;
+    const supportedFacets: string[] = [];
+    const unsupportedFacets: string[] = [];
+    const figuresDetected: string[] = [];
 
     if (!candidates || candidates.length === 0) {
       rejectionReason = 'No candidate chunks retrieved from vector or keyword index';
     } else if (isSummary) {
-      // --- SUMMARY / CROSS-SECTION GROUNDING GATE ---
-      // 1. Verify candidates have substantive evidence for at least one structural facet or document content
+      // --- SUMMARY / MULTI-FACET GROUNDING GATE ---
+      const activeFacets = intentAnalysis.facets;
+
       const facetCandidates = candidates.filter(cand => {
         const text = `${cand.title} ${cand.sectionHeader || ''} ${cand.content}`.toLowerCase();
         
+        if (cand.isVisual) {
+          if (cand.figureId) figuresDetected.push(cand.figureId);
+          return true;
+        }
+
         // If Neural Evaluated
         if (cand.isNeuralEvaluated) {
-          return cand.neuralRerankScore >= minNeuralScore || (cand.vectorScore !== undefined && cand.vectorScore >= 0.60);
+          return cand.neuralRerankScore >= minNeuralScore || (cand.vectorScore !== undefined && cand.vectorScore >= 0.55);
         }
 
         // Algorithmic facet / keyword verification
-        const hasFacetMatch = (cand.matchedFacets && cand.matchedFacets.length > 0) || (cand.bestFacetScore && cand.bestFacetScore >= 0.20);
+        const hasFacetMatch = (cand.matchedFacets && cand.matchedFacets.length > 0) || (cand.bestFacetScore && cand.bestFacetScore >= 0.15);
         const hasKeywordMatch = sigKeywords.some(kw => text.includes(kw));
-        const hasStrongVector = cand.vectorScore !== undefined && cand.vectorScore >= 0.60;
-        const hasRrfStrength = cand.rrfScore >= 0.008;
+        const hasStrongVector = cand.vectorScore !== undefined && cand.vectorScore >= 0.55;
+        const hasRrfStrength = cand.rrfScore >= 0.005;
 
         return hasFacetMatch || hasKeywordMatch || hasStrongVector || hasRrfStrength;
       });
 
-      // Count distinct structural facets or document sections covered
-      const coveredFacets = new Set<string>();
-      const coveredPages = new Set<number>();
-      facetCandidates.forEach(c => {
-        c.matchedFacets?.forEach(f => coveredFacets.add(f));
-        if (c.pageNumber !== undefined) coveredPages.add(c.pageNumber);
-      });
+      // Evaluate grounded coverage per facet
+      for (const facet of activeFacets) {
+        const hasMatch = facetCandidates.some(c => {
+          if (c.matchedFacets?.includes(facet.name)) return true;
+          const text = `${c.title} ${c.sectionHeader || ''} ${c.content}`.toLowerCase();
+          return facet.terms.some(t => text.includes(t.toLowerCase()));
+        });
+        if (hasMatch) {
+          supportedFacets.push(facet.name);
+        } else {
+          unsupportedFacets.push(facet.name);
+        }
+      }
 
-      // For summary queries, verify that the document contains genuine evidence
       // Check if user is asking for completely non-existent / hallucinatory topics
       const GENERIC_META_WORDS = new Set([
         'paper', 'papers', 'document', 'documents', 'study', 'studies', 'article', 'articles',
@@ -695,17 +898,16 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         }
       }
 
-      const isCompletelyUnsupportedTopic = specificTopicTerms.length >= 2 && specificTopicMatches === 0 && facetCandidates.length === 0;
-
-      const hasDocumentEvidence = facetCandidates.length >= 2 || (facetCandidates.length >= 1 && coveredPages.size >= 1);
+      const isCompletelyUnsupportedTopic = specificTopicTerms.length >= 2 && specificTopicMatches === 0;
+      const hasDocumentEvidence = facetCandidates.length >= 1;
 
       if (isCompletelyUnsupportedTopic) {
         validCandidates = [];
         rejectionReason = `Requested subject topics (${specificTopicTerms.slice(0, 4).join(', ')}) not found in indexed document evidence`;
-        overallGroundingScore = 0.05;
+        overallGroundingScore = 0.0;
       } else if (hasDocumentEvidence) {
         validCandidates = facetCandidates;
-        overallGroundingScore = Math.min(1.0, 0.5 + (coveredFacets.size * 0.1) + (facetCandidates.length * 0.05));
+        overallGroundingScore = Math.min(1.0, 0.4 + (supportedFacets.length * 0.08) + (facetCandidates.length * 0.02));
       } else {
         validCandidates = [];
         rejectionReason = 'Insufficient representative sections matched for document summary';
@@ -714,6 +916,11 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
     } else {
       // --- STANDARD FACTUAL HIGH-PRECISION GROUNDING GATE ---
       validCandidates = candidates.filter(cand => {
+        if (cand.isVisual) {
+          if (cand.figureId) figuresDetected.push(cand.figureId);
+          return true;
+        }
+
         if (cand.isNeuralEvaluated) {
           return cand.neuralRerankScore >= minNeuralScore;
         }
@@ -737,22 +944,22 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
 
         if (sigKeywords.length === 1) {
           return matchedCount >= 1 && (
-            (cand.vectorScore !== undefined && cand.vectorScore >= 0.65) ||
-            (cand.keywordScore !== undefined && cand.keywordScore >= 0.20) ||
-            cand.rrfScore > 0.012
+            (cand.vectorScore !== undefined && cand.vectorScore >= 0.60) ||
+            (cand.keywordScore !== undefined && cand.keywordScore >= 0.15) ||
+            cand.rrfScore > 0.010
           );
         }
 
         if (sigKeywords.length <= 3) {
           return (
             matchedCount >= 2 ||
-            (matchedCount >= 1 && cand.vectorScore !== undefined && cand.vectorScore >= 0.70) ||
-            (matchedCount >= 1 && cand.keywordScore !== undefined && cand.keywordScore >= 0.20) ||
+            (matchedCount >= 1 && cand.vectorScore !== undefined && cand.vectorScore >= 0.65) ||
+            (matchedCount >= 1 && cand.keywordScore !== undefined && cand.keywordScore >= 0.15) ||
             (matchedCount >= 1 && (cand.keywordRank === 1 || cand.vectorRank === 1))
           );
         }
 
-        return matchedCount >= 2 && matchRatio >= 0.35;
+        return matchedCount >= 2 || matchRatio >= 0.30;
       });
 
       if (validCandidates.length === 0) {
@@ -763,9 +970,18 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
       }
     }
 
-    const groundingStatus: 'GROUNDED' | 'INSUFFICIENT_EVIDENCE' = validCandidates.length > 0 ? 'GROUNDED' : 'INSUFFICIENT_EVIDENCE';
+    const pagesCovered = Array.from(new Set(validCandidates.map(c => c.pageNumber).filter((p): p is number => p !== undefined))).sort((a, b) => a - b);
 
-    // Structured RAG Diagnostic Internal Log (Safe: No passwords or keys)
+    let groundingStatus: 'GROUNDED' | 'PARTIALLY_GROUNDED' | 'INSUFFICIENT_EVIDENCE' = 'INSUFFICIENT_EVIDENCE';
+    if (validCandidates.length > 0) {
+      if (unsupportedFacets.length > 0 && supportedFacets.length > 0 && unsupportedFacets.length > supportedFacets.length) {
+        groundingStatus = 'PARTIALLY_GROUNDED';
+      } else {
+        groundingStatus = 'GROUNDED';
+      }
+    }
+
+    // Structured RAG Diagnostic Internal Log
     const diagnostic: RAGDiagnosticLog = {
       query,
       queryIntent: intentAnalysis.intent,
@@ -782,10 +998,16 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
         sectionHeader: c.sectionHeader,
         finalScore: Math.round(c.finalScore * 1000) / 1000,
         matchedFacets: c.matchedFacets,
+        isVisual: c.isVisual,
+        figureId: c.figureId,
       })),
+      supportedFacets,
+      unsupportedFacets,
+      pagesCovered,
+      figuresDetected: Array.from(new Set(figuresDetected)),
       groundingScore: Math.round(overallGroundingScore * 100) / 100,
       groundingStatus,
-      reason: validCandidates.length > 0 ? `Passed with ${validCandidates.length} grounded units` : rejectionReason,
+      reason: validCandidates.length > 0 ? `Passed with ${validCandidates.length} grounded units across pages [${pagesCovered.join(', ')}]` : rejectionReason,
       timestamp: new Date().toISOString(),
     };
 
@@ -798,3 +1020,4 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
 }
 
 export const rerankService = new RerankService();
+

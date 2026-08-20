@@ -233,12 +233,161 @@ export const api = {
     return res.json();
   },
 
+  // Resumable Chunked Streaming Upload Methods
+  async initChunkedUpload(payload: {
+    filename: string;
+    sizeBytes: number;
+    mimeType?: string;
+    chunkSize?: number;
+    clientSha256?: string;
+    collectionId?: string;
+    tags?: string[];
+  }): Promise<{
+    uploadId: string;
+    filename: string;
+    sizeBytes: number;
+    chunkSize: number;
+    totalChunks: number;
+    maxFileSizeBytes: number;
+    expiresAt: string;
+  }> {
+    const res = await fetch('/api/documents/upload/init', {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Failed to init upload' }));
+      throw new Error(err.error || 'Failed to initialize chunked upload');
+    }
+    return res.json();
+  },
+
+  async uploadChunk(
+    uploadId: string,
+    chunkIndex: number,
+    chunkBlob: Blob,
+    sha256?: string
+  ): Promise<{
+    uploadId: string;
+    chunkIndex: number;
+    size: number;
+    sha256: string;
+    uploadedBytes: number;
+    totalChunks: number;
+    completedChunksCount: number;
+    isComplete: boolean;
+  }> {
+    const headers: Record<string, string> = {
+      'x-upload-id': uploadId,
+      'x-chunk-index': String(chunkIndex),
+      'Content-Type': 'application/octet-stream',
+    };
+    if (sha256) headers['x-chunk-sha256'] = sha256;
+
+    const res = await fetch(`/api/documents/upload/${uploadId}/chunk`, {
+      method: 'POST',
+      headers: getAuthHeaders(headers),
+      body: chunkBlob,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Chunk upload failed' }));
+      throw new Error(err.error || `Failed to upload chunk ${chunkIndex}`);
+    }
+    return res.json();
+  },
+
+  async getUploadStatus(uploadId: string): Promise<{
+    uploadId: string;
+    filename: string;
+    sizeBytes: number;
+    chunkSize: number;
+    totalChunks: number;
+    uploadedBytes: number;
+    completedChunks: number[];
+    isComplete: boolean;
+    expiresAt: string;
+    status: string;
+  }> {
+    const res = await fetch(`/api/documents/upload/${uploadId}/status`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Status fetch failed' }));
+      throw new Error(err.error || 'Failed to query upload session status');
+    }
+    return res.json();
+  },
+
+  async completeChunkedUpload(uploadId: string): Promise<{
+    message: string;
+    uploadId: string;
+    documentId: string;
+    jobId: string;
+    contentHash: string;
+    sizeBytes: number;
+  }> {
+    const res = await fetch(`/api/documents/upload/${uploadId}/complete`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Complete upload failed' }));
+      throw new Error(err.error || 'Failed to complete upload session');
+    }
+    return res.json();
+  },
+
+  async abortChunkedUpload(uploadId: string): Promise<{ success: boolean; message: string }> {
+    const res = await fetch(`/api/documents/upload/${uploadId}/abort`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Abort failed' }));
+      throw new Error(err.error || 'Failed to abort upload session');
+    }
+    return res.json();
+  },
+
   async deleteDocument(id: string): Promise<{ success: boolean }> {
     const res = await fetch(`/api/documents/${id}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
     if (!res.ok) throw new Error('Failed to delete document');
+    return res.json();
+  },
+
+  async retryDocument(id: string): Promise<{ message: string; jobId: string; documentId: string }> {
+    const res = await fetch(`/api/documents/${id}/retry`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Retry failed' }));
+      throw new Error(err.error || 'Failed to retry document indexing');
+    }
+    return res.json();
+  },
+
+  async getDocumentStatus(id: string): Promise<{
+    id: string;
+    title?: string;
+    type?: DocumentType;
+    status: Document['status'];
+    progress: number;
+    statusMessage?: string;
+    chunkCount?: number;
+    pageCount?: number;
+    slideCount?: number;
+    sectionCount?: number;
+    sizeBytes?: number;
+    metrics?: Document['metrics'];
+    updatedAt: string;
+  }> {
+    const res = await fetch(`/api/documents/${id}/status`, { headers: getAuthHeaders() });
+    if (!res.ok) throw new Error('Failed to fetch document status');
     return res.json();
   },
 
