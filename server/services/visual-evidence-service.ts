@@ -30,20 +30,26 @@ export class VisualEvidenceService {
    * Render PDF pages to PNG using Ghostscript
    */
   public renderPdfPagesToPng(
-    pdfBuffer: Buffer,
+    pdfSource: Buffer | string,
     outputDir: string,
     prefix: string,
     dpi = 150
   ): { pageNumber: number; filePath: string }[] {
-    const tempPdfPath = path.join(outputDir, `${prefix}_source.pdf`);
-    fs.writeFileSync(tempPdfPath, pdfBuffer);
+    let sourcePdfPath: string;
+
+    if (typeof pdfSource === 'string' && fs.existsSync(pdfSource)) {
+      sourcePdfPath = pdfSource;
+    } else {
+      sourcePdfPath = path.join(outputDir, `${prefix}_source.pdf`);
+      fs.writeFileSync(sourcePdfPath, Buffer.isBuffer(pdfSource) ? pdfSource : Buffer.from(pdfSource));
+    }
 
     const outputPattern = path.join(outputDir, `${prefix}_page_%d.png`);
 
     try {
       execSync(
-        `gs -sDEVICE=png16m -r${dpi} -dNOPAUSE -dBATCH -dSAFER -sOutputFile="${outputPattern}" "${tempPdfPath}"`,
-        { stdio: 'pipe', timeout: 30000 }
+        `gs -sDEVICE=png16m -r${dpi} -dNOPAUSE -dBATCH -dSAFER -sOutputFile="${outputPattern}" "${sourcePdfPath}"`,
+        { stdio: 'pipe', timeout: 45000 }
       );
     } catch (err: any) {
       console.warn(`[VisualEvidenceService] Ghostscript render warning: ${err.message}`);
@@ -51,17 +57,19 @@ export class VisualEvidenceService {
 
     // Collect generated page files
     const pages: { pageNumber: number; filePath: string }[] = [];
-    const files = fs.readdirSync(outputDir);
-    const pageRegex = new RegExp(`^${prefix}_page_(\\d+)\\.png$`);
+    if (fs.existsSync(outputDir)) {
+      const files = fs.readdirSync(outputDir);
+      const pageRegex = new RegExp(`^${prefix}_page_(\\d+)\\.png$`);
 
-    for (const f of files) {
-      const match = f.match(pageRegex);
-      if (match) {
-        const pageNum = parseInt(match[1], 10);
-        pages.push({
-          pageNumber: pageNum,
-          filePath: path.join(outputDir, f),
-        });
+      for (const f of files) {
+        const match = f.match(pageRegex);
+        if (match) {
+          const pageNum = parseInt(match[1], 10);
+          pages.push({
+            pageNumber: pageNum,
+            filePath: path.join(outputDir, f),
+          });
+        }
       }
     }
 
@@ -225,7 +233,7 @@ Be strictly factual and thorough. Do not hallucinate elements not visible in the
   public async extractPdfVisualEvidence(
     documentId: string,
     documentTitle: string,
-    pdfBuffer: Buffer,
+    pdfSource: Buffer | string,
     startingChunkIndex = 0
   ): Promise<{ chunks: Chunk[]; figures: VisualFigure[] }> {
     const tempDir = path.join('/tmp', `pdf_vis_${documentId}_${Date.now()}`);
@@ -235,16 +243,19 @@ Be strictly factual and thorough. Do not hallucinate elements not visible in the
     const chunks: Chunk[] = [];
 
     try {
-      const renderedPages = this.renderPdfPagesToPng(pdfBuffer, tempDir, `doc_${documentId}`);
+      const renderedPages = this.renderPdfPagesToPng(pdfSource, tempDir, `doc_${documentId}`);
 
-      // Process page image analysis with controlled parallel concurrency
-      const pageConcurrency = 4;
+      // Process page image analysis with controlled parallel concurrency (2 pages at a time)
+      const pageConcurrency = 2;
       for (let i = 0; i < renderedPages.length; i += pageConcurrency) {
         const pageSlice = renderedPages.slice(i, i + pageConcurrency);
         const results = await Promise.all(
           pageSlice.map(async page => {
             try {
+              if (!fs.existsSync(page.filePath)) return [];
               const imageBuffer = fs.readFileSync(page.filePath);
+              // Clean up disk immediately after reading
+              try { fs.unlinkSync(page.filePath); } catch {}
               return await this.analyzePageImage(page.pageNumber, imageBuffer, documentTitle);
             } catch (pageErr: any) {
               console.warn(`[VisualEvidenceService] Error processing page ${page.pageNumber}: ${pageErr.message}`);

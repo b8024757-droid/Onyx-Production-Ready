@@ -34,7 +34,7 @@ export const config = {
     rrfConstantK: 60,
   },
   upload: {
-    maxFileSizeMb: parseInt(process.env.MAX_FILE_SIZE_MB || '250', 10),
+    maxFileSizeMb: 500,
     chunkSizeMb: parseInt(process.env.UPLOAD_CHUNK_SIZE_MB || '5', 10),
     sessionTtlMinutes: parseInt(process.env.UPLOAD_SESSION_TTL_MINUTES || '60', 10),
     get maxFileSizeBytes(): number {

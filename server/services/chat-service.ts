@@ -409,6 +409,118 @@ Provide an analytical, grounded answer with inline citations [[01]], [[02]]:`;
     });
   }
 
+  /**
+   * Direct non-streaming query method for programmatic testing, benchmarking, and automated regression suites.
+   */
+  public async queryDirect(
+    query: string,
+    options: {
+      conversationId?: string;
+      collectionId?: string;
+      documentId?: string;
+      userId?: string;
+    } = {}
+  ): Promise<{ content: string; citations: any[]; grounded: boolean }> {
+    const effectiveUserId = options.userId || 'user-default-admin';
+    const effectiveRetrievalQuery = query;
+
+    const intentAnalysis = rerankService.detectQueryIntent(effectiveRetrievalQuery);
+    const isSummaryMode = intentAnalysis.isSummaryOrCrossSection;
+    const candidateLimit = isSummaryMode ? 50 : (config.rag.topKCandidates || 20);
+
+    let vectorResults: any[] = [];
+    try {
+      const queryVector = await vectorService.getEmbedding(effectiveRetrievalQuery, { isQuery: true });
+      vectorResults = await vectorService.search({
+        vector: queryVector,
+        limit: candidateLimit,
+        filter: {
+          collectionId: options.collectionId,
+          documentId: options.documentId,
+          userId: effectiveUserId,
+        },
+      });
+    } catch {
+      vectorResults = [];
+    }
+
+    const keywordResults = await keywordService.search({
+      query: effectiveRetrievalQuery,
+      limit: candidateLimit,
+      filter: {
+        collectionId: options.collectionId,
+        documentId: options.documentId,
+        userId: effectiveUserId,
+      },
+    });
+
+    const rrfTopN = isSummaryMode ? 36 : (config.rag.topKReranked || 6);
+    const rrfCandidates = rerankService.reciprocalRankFusion(vectorResults, keywordResults, {
+      k: config.rag.rrfConstantK || 60,
+      topN: rrfTopN,
+    });
+
+    const rerankTopK = isSummaryMode ? 24 : (config.rag.topKReranked || 6);
+    const finalCandidates = await rerankService.neuralRerank(
+      query,
+      rrfCandidates,
+      rerankTopK,
+      {
+        skipNeural: false,
+        timeoutMs: 2500,
+        isSummaryMode,
+        facets: intentAnalysis.facets,
+      }
+    );
+
+    const validCandidates = rerankService.filterGroundedCandidates(query, finalCandidates, {
+      isSummaryMode,
+      intentAnalysis,
+    });
+
+    if (validCandidates.length === 0) {
+      return {
+        content: 'The current knowledge base does not contain sufficient evidence to answer this question.',
+        citations: [],
+        grounded: false,
+      };
+    }
+
+    const grounded = ContextService.buildGroundedContext(validCandidates, isSummaryMode ? 7500 : 3500);
+
+    // Call Gemini for response synthesis
+    const ai = getGeminiClient(options.userId);
+    let finalContent = '';
+    if (ai) {
+      try {
+        const gen = await ai.models.generateContent({
+          model: config.gemini.textModel || 'gemini-3.6-flash',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: `GROUNDED SOURCES:\n${grounded.promptContext}\n\nUSER QUESTION: "${query}"\nProvide a precise, factual answer based strictly on the grounded sources.`,
+                },
+              ],
+            },
+          ],
+        });
+        finalContent = gen.text || '';
+      } catch {
+        finalContent = this.synthesizeGroundedAnswer(query, grounded.citations);
+      }
+    } else {
+      finalContent = this.synthesizeGroundedAnswer(query, grounded.citations);
+    }
+
+    return {
+      content: finalContent,
+      citations: grounded.citations,
+      grounded: true,
+    };
+  }
+
   private synthesizeGroundedAnswer(query: string, citations: any[]): string {
     if (!citations || citations.length === 0) {
       return 'The current knowledge base does not contain sufficient evidence to answer this question.';

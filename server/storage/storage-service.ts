@@ -443,12 +443,11 @@ export class StorageService {
     return this.saveFile(filename, buffer, mimeType);
   }
 
-  public async getFileBuffer(storagePath: string): Promise<Buffer> {
+  public resolveStoragePath(storagePath: string): string {
     if (fs.existsSync(storagePath)) {
-      return fs.promises.readFile(storagePath);
+      return storagePath;
     }
 
-    // Cross-platform & relocation fallback
     const normalizedPath = storagePath.replace(/\\/g, '/');
     const filename = path.basename(normalizedPath);
 
@@ -461,11 +460,38 @@ export class StorageService {
 
     for (const cand of candidates) {
       if (fs.existsSync(cand)) {
-        return fs.promises.readFile(cand);
+        return cand;
       }
     }
 
     throw new Error(`File not found on server: ${filename}. Please re-upload the document.`);
+  }
+
+  public getFileStream(storagePath: string): fs.ReadStream {
+    const resolvedPath = this.resolveStoragePath(storagePath);
+    return fs.createReadStream(resolvedPath);
+  }
+
+  public getFileSize(storagePath: string): number {
+    const resolvedPath = this.resolveStoragePath(storagePath);
+    const stats = fs.statSync(resolvedPath);
+    return stats.size;
+  }
+
+  public async computeFileChecksumStream(storagePath: string): Promise<string> {
+    const resolvedPath = this.resolveStoragePath(storagePath);
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(resolvedPath);
+      stream.on('data', chunk => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', err => reject(err));
+    });
+  }
+
+  public async getFileBuffer(storagePath: string): Promise<Buffer> {
+    const resolvedPath = this.resolveStoragePath(storagePath);
+    return fs.promises.readFile(resolvedPath);
   }
 
   public async deleteFile(storagePath: string): Promise<boolean> {

@@ -311,7 +311,27 @@ export class DatabaseService {
     }
   }
 
-  public saveSnapshot() {
+  private snapshotTimer: NodeJS.Timeout | null = null;
+
+  public saveSnapshot(immediate = false) {
+    if (immediate) {
+      if (this.snapshotTimer) {
+        clearTimeout(this.snapshotTimer);
+        this.snapshotTimer = null;
+      }
+      this.writeSnapshotToDisk();
+      return;
+    }
+
+    if (!this.snapshotTimer) {
+      this.snapshotTimer = setTimeout(() => {
+        this.snapshotTimer = null;
+        this.writeSnapshotToDisk();
+      }, 500);
+    }
+  }
+
+  private writeSnapshotToDisk() {
     try {
       const payload = {
         users: Array.from(this.users.values()),

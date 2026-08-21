@@ -954,12 +954,16 @@ Example: [{"passageIndex": 1, "relevanceScore": 0.95}, {"passageIndex": 2, "rele
           return (
             matchedCount >= 2 ||
             (matchedCount >= 1 && cand.vectorScore !== undefined && cand.vectorScore >= 0.65) ||
-            (matchedCount >= 1 && cand.keywordScore !== undefined && cand.keywordScore >= 0.15) ||
-            (matchedCount >= 1 && (cand.keywordRank === 1 || cand.vectorRank === 1))
+            (matchedCount >= 1 && cand.keywordScore !== undefined && cand.keywordScore >= 0.25)
           );
         }
 
-        return matchedCount >= 2 || matchRatio >= 0.30;
+        // For queries with 4+ keywords (e.g. detailed or hallucinated questions),
+        // require substantive keyword coverage (at least 40% match ratio or 3+ matches with strong vector/keyword score)
+        return (
+          matchRatio >= 0.40 ||
+          (matchedCount >= 3 && ((cand.vectorScore !== undefined && cand.vectorScore >= 0.60) || (cand.keywordScore !== undefined && cand.keywordScore >= 0.20)))
+        );
       });
 
       if (validCandidates.length === 0) {

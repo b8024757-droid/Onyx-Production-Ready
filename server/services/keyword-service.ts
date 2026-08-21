@@ -170,6 +170,14 @@ export class KeywordService {
     return results.slice(0, limit);
   }
 
+  public getStats(): { totalDocuments: number; totalTerms: number; avgDocLength: number } {
+    return {
+      totalDocuments: this.totalChunks,
+      totalTerms: this.invertedIndex.size,
+      avgDocLength: this.totalChunks > 0 ? Math.round(this.totalLength / this.totalChunks) : 0,
+    };
+  }
+
   private tokenize(text?: string): string[] {
     if (!text || typeof text !== 'string') return [];
     return text

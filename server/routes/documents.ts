@@ -27,7 +27,7 @@ const chunkUpload = multer({
 });
 
 // =========================================================================
-// CHUNKED RESUMABLE STREAMING UPLOAD ENDPOINTS (For Large Files up to 250MB+)
+// CHUNKED RESUMABLE STREAMING UPLOAD ENDPOINTS (For Large Files up to 500MB)
 // =========================================================================
 
 /**

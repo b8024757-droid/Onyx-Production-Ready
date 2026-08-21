@@ -6,7 +6,11 @@ import { HTMLParser } from './html-parser';
 import { URLFetcher } from './url-fetcher';
 import { MarkdownParser } from './markdown-parser';
 import { OCRParser } from './ocr-parser';
+import { StreamingDocumentParser, StreamParseOptions, StreamParseSummary, AdaptiveChunkConfig } from './stream-parser';
 import { DocumentType } from '../../src/types';
+
+export { StreamingDocumentParser };
+export type { StreamParseOptions, StreamParseSummary, AdaptiveChunkConfig };
 
 export interface NormalizedSection {
   heading: string;

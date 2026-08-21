@@ -450,9 +450,9 @@ export const AddKnowledgeModal: React.FC = () => {
       return;
     }
 
-    const maxBytes = 250 * 1024 * 1024;
+    const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
-      showToast('error', 'File Too Large', `File size (${(file.size / 1024 / 1024).toFixed(1)} MB) exceeds 250 MB limit.`);
+      showToast('error', 'File Too Large', `File size (${(file.size / 1024 / 1024).toFixed(1)} MB) exceeds 500 MB limit.`);
       return;
     }
 
@@ -829,7 +829,7 @@ export const AddKnowledgeModal: React.FC = () => {
                         : 'Click to upload or drag and drop'}
                     </p>
                     <p className="text-xs text-[#929892] mt-1">
-                      PDF, DOCX, PPTX, XLSX, CSV, MD, TXT, images (up to 250 MB)
+                      PDF, DOCX, PPTX, XLSX, CSV, MD, TXT, images (up to 500 MB)
                     </p>
                   </div>
                 </div>
